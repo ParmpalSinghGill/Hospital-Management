@@ -1,0 +1,44 @@
+{
+  "doctors": [
+    {
+      "name": "Dr. Gregory House",
+      "department": "Diagnostics"
+    },
+    {
+      "name": "Dr. Meredith Grey",
+      "department": "General Surgery"
+    },
+    {
+      "name": "Dr. Derek Shepherd",
+      "department": "Neurosurgery"
+    },
+    {
+      "name": "Dr. Cristina Yang",
+      "department": "Cardiothoracic Surgery"
+    },
+    {
+      "name": "Dr. James Wilson",
+      "department": "Oncology"
+    },
+    {
+      "name": "Dr. Lisa Cuddy",
+      "department": "Endocrinology"
+    },
+    {
+      "name": "Dr. Miranda Bailey",
+      "department": "General Surgery"
+    },
+    {
+      "name": "Dr. Arizona Robbins",
+      "department": "Pediatric Surgery"
+    },
+    {
+      "name": "Dr. Mark Sloan",
+      "department": "Plastic Surgery"
+    },
+    {
+      "name": "Dr. Owen Hunt",
+      "department": "Trauma Surgery"
+    }
+  ]
+}
