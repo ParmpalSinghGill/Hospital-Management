@@ -25,6 +25,8 @@ def _ensure_dataset_seeded() -> None:
                 {"name": "Dr. Arizona Robbins", "department": "Pediatric Surgery"},
                 {"name": "Dr. Mark Sloan", "department": "Plastic Surgery"},
                 {"name": "Dr. Owen Hunt", "department": "Trauma Surgery"},
+                {"name": "Dr. Mark Hunt", "department": "Orthopedics"},
+                {"name": "Dr. Owen Sloan", "department": "Orthopedics"},
             ]
         }
         with open(DOCTORS_DB, "w", encoding="utf-8") as f:
@@ -47,6 +49,43 @@ def _read_json(path: str, default: Any) -> Any:
 def _write_json(path: str, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def clear_appointments() -> int:
+    """Reset appointments.json to an empty list. Returns the number of entries removed."""
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    old = _read_json(APPOINTMENTS_DB, {"appointments": []})
+    old_count = len(old.get("appointments", []))
+    _write_json(APPOINTMENTS_DB, {"appointments": []})
+    return old_count
+
+
+def clear_all(reseed_doctors: bool = True) -> dict:
+    """Delete appointments and doctors files. Optionally re-seed doctors.
+
+    Returns a dict with counts of removed appointments and whether files existed.
+    """
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    stats = {"appointments_removed": 0, "appointments_file": False, "doctors_file": False, "reseeded": False}
+
+    old_appts = _read_json(APPOINTMENTS_DB, {"appointments": []})
+    stats["appointments_removed"] = len(old_appts.get("appointments", []))
+    try:
+        os.remove(APPOINTMENTS_DB)
+        stats["appointments_file"] = True
+    except FileNotFoundError:
+        pass
+    try:
+        os.remove(DOCTORS_DB)
+        stats["doctors_file"] = True
+    except FileNotFoundError:
+        pass
+
+    if reseed_doctors:
+        _ensure_dataset_seeded()
+        stats["reseeded"] = True
+
+    return stats
 
 
 def _load_doctors() -> List[Dict[str, str]]:
@@ -302,7 +341,10 @@ if __name__ == "__main__":
     #   python MakeDataBase.py 2025-01-01 2025-01-05 --range --per-doctor 5
     import argparse
 
-    parser = argparse.ArgumentParser(description="Seed random appointments (10-minute slots).")
+    parser = argparse.ArgumentParser(description="Seed random appointments (10-minute slots) or clear database.")
+    parser.add_argument("--clear-appointments", action="store_true", help="Reset appointments.json to empty list and exit.")
+    parser.add_argument("--clear-all", action="store_true", help="Delete both doctors.json and appointments.json, then re-seed doctors.json by default and exit.")
+    parser.add_argument("--no-reseed", action="store_true", help="With --clear-all, do not re-seed doctors.json.")
     parser.add_argument("--days", type=int, default=3, help="Number of days including today to seed.")
     parser.add_argument("date", nargs="*", help="Dates YYYY-MM-DD. If --range, provide START END.")
     parser.add_argument("--range", action="store_true", help="Interpret provided dates as inclusive range.")
@@ -314,6 +356,16 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     _ensure_dataset_seeded()
+    args.clear_appointments=True
+
+    if args.clear_all:
+        stats = clear_all(reseed_doctors=(not args.no_reseed))
+        print(f"Cleared database: removed {stats['appointments_removed']} appointments. appointments.json existed={stats['appointments_file']} doctors.json existed={stats['doctors_file']} reseeded_doctors={stats['reseeded']}")
+
+    if args.clear_appointments:
+        n = clear_appointments()
+        print(f"Cleared appointments.json; removed {n} appointments.")
+
 
     if args.days is not None:
         if args.days <= 0:

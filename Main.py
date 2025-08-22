@@ -1,194 +1,29 @@
 import os
-from dotenv import load_dotenv
 import json
+from dotenv import load_dotenv
 import sys
-from typing import Dict, Any, List, Tuple, Optional
+from typing import  Any, List, TypedDict, Literal
 load_dotenv()
 import logging
 import re
-
+from datetime import datetime
+from pprint import pformat
 from langgraph.prebuilt import create_react_agent
-from langchain_core.tools import tool
+
 from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, END
 
-# logging.basicConfig(
-#     level=logging.INFO,
-#     format="%(asctime)s - %(funcName)s - %(levelname)s - %(message)s",
-#     datefmt="%H:%M:%S",
-# )
+from Tools import list_doctors,book_appointment,cancel_appointment,reschedule_appointment
+HospitalName="DBC"
 
-# ------------------------------
-# JSON "databases" under ./dataset
-# ------------------------------
-BASE_DIR = os.path.dirname(__file__)
-DATASET_DIR = os.path.join(BASE_DIR, "dataset")
-DOCTORS_DB = os.path.join(DATASET_DIR, "doctors.json")
-APPOINTMENTS_DB = os.path.join(DATASET_DIR, "appointments.json")
-
-
-
-
-def _read_json(path: str, default: Any) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default
-    except json.JSONDecodeError:
-        return default
-
-
-def _write_json(path: str, data: Any) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
-def _normalize_doctor_name(name: str) -> str:
-    n = name.strip().lower()
-    if n.startswith("dr. "):
-        n = n[4:]
-    elif n.startswith("dr "):
-        n = n[3:]
-    return n
-
-
-def _load_doctors() -> List[Dict[str, str]]:
-    db = _read_json(DOCTORS_DB, {"doctors": []})
-    return db.get("doctors", [])
-
-
-def _get_doctor_by_name(name: str) -> Optional[Dict[str, str]]:
-    target = _normalize_doctor_name(name)
-    for d in _load_doctors():
-        if _normalize_doctor_name(d.get("name", "")) == target:
-            return d
-    return None
-
-
-def _load_all_appointments() -> List[Dict[str, Any]]:
-    db = _read_json(APPOINTMENTS_DB, {"appointments": []})
-    return db.get("appointments", [])
-
-
-def _save_all_appointments(appts: List[Dict[str, Any]]) -> None:
-    _write_json(APPOINTMENTS_DB, {"appointments": appts})
-
-
-def _extract_id_number(appointment_id: str) -> int:
-    # APT-0001 -> 1
-    try:
-        return int(appointment_id.split("-")[1])
-    except Exception:
-        return 0
-
-
-def _get_next_appointment_id(appts: List[Dict[str, Any]]) -> str:
-    max_num = 0
-    for a in appts:
-        aid = a.get("appointment_id", "")
-        max_num = max(max_num, _extract_id_number(aid))
-    return f"APT-{(max_num + 1):04d}"
-
-
-def _find_conflict(appts: List[Dict[str, Any]], doctor_name: str, time_str: str) -> Optional[Dict[str, Any]]:
-    doc_norm = _normalize_doctor_name(doctor_name)
-    time_norm = time_str.strip().lower()
-    for a in appts:
-        if a.get("status") == "CANCELLED":
-            continue
-        if _normalize_doctor_name(a.get("doctor", "")) == doc_norm and str(a.get("time", "")).strip().lower() == time_norm:
-            return a
-    return None
-
-
-# ------------------------------
-# Tools using JSON "databases"
-# ------------------------------
-@tool
-def book_appointment(patient_name: str, doctor: str, time: str) -> str:
-    """Book an appointment after validating doctor exists and time is free.
-
-    Args:
-        patient_name: The full name of the patient.
-        doctor: The doctor's name the patient wants to see.
-        time: The appointment time (free-text or ISO 8601).
-
-    Returns:
-        JSON string with result: ok, message, and appointment if created.
-    """
-
-    # Validate doctor
-    doctor_row = _get_doctor_by_name(doctor)
-    if not doctor_row:
-        return json.dumps({
-            "ok": False,
-            "message": f"Doctor not found: {doctor}. Use the full name as in the directory.",
-        })
-
-    # Load and check conflicts
-    appts = _load_all_appointments()
-    conflict = _find_conflict(appts, doctor_row["name"], time)
-    if conflict:
-        return json.dumps({
-            "ok": False,
-            "message": f"Time conflict: {doctor_row['name']} already has an appointment at '{time}'.",
-            "conflict": conflict,
-        })
-
-    # Create appointment
-    appointment_id = _get_next_appointment_id(appts)
-    new_appt = {
-        "appointment_id": appointment_id,
-        "patient_name": patient_name,
-        "doctor": doctor_row["name"],  # store canonical name
-        "department": doctor_row.get("department", ""),
-        "time": time,
-        "status": "BOOKED",
-    }
-    appts.append(new_appt)
-    _save_all_appointments(appts)
-
-    return json.dumps({
-        "ok": True,
-        "message": "Appointment booked",
-        "appointment": new_appt,
-    })
-
-
-@tool
-def cancel_appointment(appointment_id: str) -> str:
-    """Cancel an existing appointment by its ID.
-
-    Args:
-        appointment_id: The appointment identifier (e.g., APT-0001).
-
-    Returns:
-        JSON string indicating whether the cancellation succeeded and the record (if any).
-    """
-
-    appts = _load_all_appointments()
-
-    for a in appts:
-        if a.get("appointment_id") == appointment_id:
-            if a.get("status") == "CANCELLED":
-                _save_all_appointments(appts)
-                return json.dumps({
-                    "ok": True,
-                    "message": "Appointment already cancelled",
-                    "appointment": a,
-                })
-            a["status"] = "CANCELLED"
-            _save_all_appointments(appts)
-            return json.dumps({
-                "ok": True,
-                "message": "Appointment cancelled",
-                "appointment": a,
-            })
-
-    return json.dumps({
-        "ok": False,
-        "message": f"Appointment not found: {appointment_id}",
-    })
+logfile="app.log"
+open(logfile,"w").close()
+logging.basicConfig(
+    filename=logfile,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 
 def _init_model() -> Any:
@@ -204,61 +39,24 @@ def _init_model() -> Any:
     )
 
 
-# ------------------------------
-# Tools using JSON "databases"
-# ------------------------------
-@tool
-def list_doctors(department: Optional[str] = None, query: Optional[str] = None, limit: int = 10) -> str:
-    """List doctors from the directory, optionally filtered by department or a name query.
-
-    Args:
-        department: Filter by department (case-insensitive; substring match).
-        query: Filter by name (case-insensitive; matches without the 'Dr.' prefix).
-        limit: Maximum number of results to return.
-
-    Returns:
-        JSON string with 'ok', 'count', and 'doctors' list.
-    """
-    docs = _load_doctors()
-    dep = (department or "").strip().lower()
-    q = (query or "").strip().lower()
-
-    def _norm_name(n: str) -> str:
-        n = n.strip().lower()
-        if n.startswith("dr. "):
-            n = n[4:]
-        elif n.startswith("dr "):
-            n = n[3:]
-        return n
-
-    if dep:
-        docs = [d for d in docs if dep in (d.get("department", "").strip().lower())]
-
-    if q:
-        docs = [d for d in docs if q in _norm_name(d.get("name", ""))]
-
-    docs = docs[: max(1, int(limit))]
-    return json.dumps({"ok": True, "count": len(docs), "doctors": docs})
-
 # -------- Router + Specialized Agents --------
 def build_general_agent():
-    print("build_general_agent call")
     model = _init_model()
-    tools = [book_appointment, cancel_appointment, list_doctors]
+    tools = []
     state_modifier = (
-        "You are a hospital assistant.\n"
+        f"You are a hospital assistant at {HospitalName}.\n"
         "- Handle general chit-chat briefly.\n"
-        "- Only call tools if the user explicitly asks to book or cancel an appointment.\n"
-        "- If details are missing for booking or canceling, ask exactly one concise clarifying question.\n"
-        "- When the user asks for a doctor suggestion or mentions a department, call list_doctors to suggest real doctors from the directory; never invent names.\n"
-        "- When booking, the tool will validate the doctor against the directory and check for time conflicts."
+        "- greet from hospital "
+        "- Do NOT provide doctor suggestions and do NOT call any tools.\n"
+        "- Your main job is to clarify the user's intent (booking, cancelling, rescheduling, or other) with short question if unclear.\n"
+        "- don't provide available option try to clarify from small questions"
+        "- Once intent is clear from their reply, the router will forward to the appropriate specialist."
     )
     return create_react_agent(model, tools, state_modifier=state_modifier)
 
 
 
 def build_booking_agent():
-    print("build_booking_agent call")
     model = _init_model()
     tools = [book_appointment, list_doctors]
     state_modifier = (
@@ -273,65 +71,213 @@ def build_booking_agent():
     )
     return create_react_agent(model, tools, state_modifier=state_modifier)
 
-def detect_booking_intent(text: str) -> bool:
-    t = text.lower()
-    if "appointment" not in t and "appt" not in t:
-        return False
-    verbs = ["book", "schedule", "make", "set", "arrange", "fix", "reserve"]
-    return any(v in t for v in verbs)
+
+def build_cancellation_agent():
+    model = _init_model()
+    tools = [cancel_appointment]
+    state_modifier = (
+        "You are the Cancellation Agent.\n"
+        "- Your job is to CANCEL an appointment.\n"
+        "- Always ensure you have the appointment_id (e.g., APT-0001) before calling the tool.\n"
+        "- If appointment_id is missing, ask for it concisely.\n"
+        "- After a successful cancellation, confirm succinctly."
+    )
+    return create_react_agent(model, tools, state_modifier=state_modifier)
 
 
-def run_turn(agent, prior_messages: List[Any], user_input: str) -> Tuple[List[Any], str]:
-    input_messages = list(prior_messages) if prior_messages else []
-    input_messages.append(("user", user_input))
-    result = agent.invoke({"messages": input_messages}, config={"recursion_limit": 5})
-    messages = result.get("messages", [])
-    final_message = messages[-1] if messages else None
-    content = getattr(final_message, "content", None) if final_message else ""
-    content = content if isinstance(content, str) else (str(final_message) if final_message else "")
-    return messages, content
+def build_reschedule_agent():
+    model = _init_model()
+    tools = [reschedule_appointment, list_doctors]
+    state_modifier = (
+        "You are the Rescheduling Agent.\n"
+        "- Your job is to RESCHEDULE an existing appointment to a new time.\n"
+        "- Always ensure you have appointment_id and new_time before calling the tool.\n"
+        "- If either is missing, ask one concise clarifying question.\n"
+        "- If the requested time is taken, inform the user and ask for another time.\n"
+        "- If the user asks to change the doctor as part of rescheduling, call list_doctors (optionally filtered by department or name) to suggest valid doctors from the directory; never invent names."
+    )
+    return create_react_agent(model, tools, state_modifier=state_modifier)
+
+class GraphState(TypedDict):
+    messages: List[Any]
+
+
+def build_graph():
+    general_agent = build_general_agent()
+    booking_agent = build_booking_agent()
+    cancellation_agent = build_cancellation_agent()
+    reschedule_agent = build_reschedule_agent()
+
+    def _extract_last_user_text(messages: List[Any]) -> str:
+        for msg in reversed(messages):
+            if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "user":
+                return str(msg[1])
+            role = getattr(msg, "type", getattr(msg, "role", None))
+            if role == "human" or role == "user":
+                content = getattr(msg, "content", "")
+                return content if isinstance(content, str) else str(content)
+        return ""
+
+    def route_decider(state: GraphState) -> Literal["general", "booking", "cancelling", "rescheduling"]:
+        logging.info(f"route_decider {pformat(state)}")
+        model = _init_model()
+        last_user = _extract_last_user_text(state.get("messages", []))
+        system = (
+            "You are a router that decides which specialist should handle the next turn.\n"
+            "Return exactly one token: 'general', 'booking', 'cancelling', or 'rescheduling'.\n"
+            "- 'booking' for booking or scheduling a new appointment.\n"
+            "- 'cancelling' for cancellation requests.\n"
+            "- 'rescheduling' when changing/moving an existing appointment's time.\n"
+            "- Otherwise 'general'."
+        )
+        resp = model.invoke([
+            ("system", system),
+            ("user", f"Message: {last_user}")
+        ])
+        logging.info(f"route_decider resp {resp}")
+        text = str(getattr(resp, "content", resp)).strip().lower()
+        # Heuristic override to prefer specialized nodes when intent words appear in the raw user text
+        raw = (last_user or "").lower()
+        choice: str
+        if ("cancel" in text or "cancelling" in text) or ("cancel" in raw or "delete appointment" in raw):
+            choice = "cancelling"
+        elif ("resched" in text or "re-sched" in text or "move" in text or "change time" in text) or ("resched" in raw or "reschedule" in raw or "move" in raw):
+            choice = "rescheduling"
+        elif ("book" in text or "appointment" in text or "schedule" in text) or ("book" in raw or "appointment" in raw or "schedule" in raw or "doctor" in raw):
+            choice = "booking"
+        else:
+            choice = "general"
+        logging.info(f"route_decider choise: {choice}")
+        return choice  # type: ignore[return-value]
+
+    def router_node(state: GraphState) -> GraphState:
+        logging.info("Running node: router")
+        return state
+
+    def _append_chat_record(node: str, state_messages: List[Any], result_messages: List[Any]) -> None:
+        try:
+            user_text = ""
+            for msg in reversed(state_messages):
+                role = getattr(msg, "type", getattr(msg, "role", None)) if not isinstance(msg, tuple) else msg[0]
+                content = getattr(msg, "content", None) if not isinstance(msg, tuple) else msg[1]
+                if role in ("human", "user"):
+                    user_text = content if isinstance(content, str) else str(content)
+                    break
+            assistant_text = ""
+            if result_messages:
+                final = result_messages[-1]
+                assistant_text = getattr(final, "content", None)
+                if not isinstance(assistant_text, str):
+                    assistant_text = str(final)
+            record = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "node": node,
+                "user": user_text,
+                "assistant": assistant_text,
+            }
+            if CHAT_LOG_PATH:
+                with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record) + "\n")
+        except Exception as e:
+            logging.error(f"Failed to append chat record: {e}")
+
+    def general_node(state: GraphState) -> GraphState:
+        logging.info(f"Running node: general {pformat(state)}")
+        prev = state.get("messages", [])
+        result = general_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
+        logging.info(f"Running node: general result {pformat(result)}")
+        msgs = result.get("messages", [])
+        _append_chat_record("general", prev, msgs)
+        return {"messages": msgs}
+
+    def booking_node(state: GraphState) -> GraphState:
+        logging.info(f"Running node: booking {pformat(state)}")
+        prev = state.get("messages", [])
+        result = booking_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
+        msgs = result.get("messages", [])
+        _append_chat_record("booking", prev, msgs)
+        return {"messages": msgs}
+
+    def cancelling_node(state: GraphState) -> GraphState:
+        logging.info(f"Running node: cancelling {pformat(state)}")
+        prev = state.get("messages", [])
+        result = cancellation_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
+        msgs = result.get("messages", [])
+        _append_chat_record("cancelling", prev, msgs)
+        return {"messages": msgs}
+
+    def rescheduling_node(state: GraphState) -> GraphState:
+        logging.info(f"Running node: rescheduling {pformat(state)}")
+        prev = state.get("messages", [])
+        result = reschedule_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
+        msgs = result.get("messages", [])
+        _append_chat_record("rescheduling", prev, msgs)
+        return {"messages": msgs}
+
+    graph = StateGraph(GraphState)
+    graph.add_node("router", router_node)
+    graph.add_node("general", general_node)
+    graph.add_node("booking", booking_node)
+    graph.add_node("cancelling", cancelling_node)
+    graph.add_node("rescheduling", rescheduling_node)
+    graph.set_entry_point("router")
+    graph.add_conditional_edges("router", route_decider, {
+        "general": "general",
+        "booking": "booking",
+        "cancelling": "cancelling",
+        "rescheduling": "rescheduling",
+    })
+    # Let general immediately re-route in the same turn; specialists end the run
+    # graph.add_edge("general", "router")
+    graph.add_edge("general", END)
+    graph.add_edge("booking", END)
+    graph.add_edge("cancelling", END)
+    graph.add_edge("rescheduling", END)
+    return graph.compile()
 
 
 def main():
+    # Prepare per-session chat log file
+    base_dir = os.path.dirname(__file__)
+    chats_dir = os.path.join(base_dir, "chats")
+    os.makedirs(chats_dir, exist_ok=True)
+    session_name = datetime.now().strftime("chat-%Y%m%d-%H%M%S.jsonl")
+    global CHAT_LOG_PATH
+    CHAT_LOG_PATH = os.path.join(chats_dir, session_name)
+    # create file with a header comment line
+    try:
+        with open(CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"session_started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}) + "\n")
+    except Exception as e:
+        logging.error(f"Failed to initialize chat log file: {e}")
 
+    app = build_graph()
 
-    general_agent = build_general_agent()
-    booking_agent = build_booking_agent()
-
-    general_messages: List[Any] = []
-    booking_messages: List[Any] = []
-    active_mode: str = "general"  # "general" | "booking"
+    # Conversation state persists across turns
+    messages: List[Any] = []
 
     if len(sys.argv) > 1:
         user_input = " ".join(sys.argv[1:])
-        if detect_booking_intent(user_input):
-            _, output = run_turn(booking_agent, booking_messages, user_input)
-        else:
-            _, output = run_turn(general_agent, general_messages, user_input)
-        print(output)
+        messages.append(("user", user_input))
+        result = app.invoke({"messages": messages}, config={"recursion_limit": 5})
+        messages = result.get("messages", messages)
+        final = messages[-1] if messages else None
+        content = getattr(final, "content", None) if final else ""
+        print(content if isinstance(content, str) else str(final))
         return
 
-    print("Hospital Agent ready. Type your request (Ctrl+C to exit).")
-    print("- Say 'book an appointment ...' to switch to the booking agent.\n")
+    print("Hospital Agent ready. Type your request (Ctrl+C to exit).\n")
     try:
         while True:
             user_input = input("> ").strip()
             if not user_input:
                 continue
-
-            if detect_booking_intent(user_input):
-                active_mode = "booking"
-
-            if active_mode == "booking":
-                booking_messages, output = run_turn(booking_agent, booking_messages, user_input)
-                print(output)
-                if re.search(r"\bappointment booked\b", output.lower()):
-                    active_mode = "general"
-                    booking_messages = []
-                continue
-
-            general_messages, output = run_turn(general_agent, general_messages, user_input)
-            print(output)
+            messages.append(("user", user_input))
+            result = app.invoke({"messages": messages}, config={"recursion_limit": 5})
+            messages = result.get("messages", messages)
+            final = messages[-1] if messages else None
+            content = getattr(final, "content", None) if final else ""
+            print(content if isinstance(content, str) else str(final))
 
     except KeyboardInterrupt:
         print("\nGoodbye!")

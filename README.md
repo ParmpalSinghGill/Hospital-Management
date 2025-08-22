@@ -36,5 +36,3 @@ Example prompts you can try interactively:
 
 Note: The storage is in-memory and will reset each time the process restarts.
 
-# Hospital-Management
-# Hospital-Management
