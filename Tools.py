@@ -24,7 +24,7 @@ def book_appointment(patient_name: str, doctor: str, time: str) -> str:
     Returns:
         JSON string with result: ok, message, and appointment if created.
     """
-    logging.info("book_appointment",patient_name,doctor,time)
+    logging.info("book_appointment %s %s %s",patient_name,doctor,time)
     # Validate doctor
     doctor_row = _get_doctor_by_name(doctor)
     if not doctor_row:
@@ -73,7 +73,7 @@ def cancel_appointment(appointment_id: str) -> str:
     Returns:
         JSON string indicating whether the cancellation succeeded and the record (if any).
     """
-    logging.info("cancel_appointment",appointment_id)
+    logging.info("cancel_appointment %s",appointment_id)
 
     appts = _load_all_appointments()
 
@@ -111,7 +111,7 @@ def reschedule_appointment(appointment_id: str, new_time: str) -> str:
     Returns:
         JSON string with ok, message, and updated appointment if successful.
     """
-    logging.info("reschedule_appointment",appointment_id,new_time)
+    logging.info("reschedule_appointment %s %s",appointment_id,new_time)
     appts = _load_all_appointments()
     # Find the appointment
     target = None
@@ -154,7 +154,7 @@ def list_doctors(department: Optional[str] = None, query: Optional[str] = None, 
     Returns:
         JSON string with 'ok', 'count', and 'doctors' list.
     """
-    logging.info("list_doctors",department, query)
+    logging.info("list_doctors %s %s",department, query)
     docs = _load_doctors()
     dep = (department or "").strip().lower()
     q = (query or "").strip().lower()

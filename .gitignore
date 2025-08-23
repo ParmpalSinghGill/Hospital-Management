@@ -3,3 +3,5 @@ dataset
 chats
 app.log
 *.xml
+GraphApi.py
+FuctionalApi.py

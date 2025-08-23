@@ -39,6 +39,33 @@ def _init_model() -> Any:
     )
 
 
+def build_router_agent():
+    """Build a ReAct agent specifically for routing decisions."""
+    model = _init_model()
+    tools = []  # No tools needed for routing
+    state_modifier = (
+        "You are a routing specialist for a hospital system.\n"
+        "Your job is to classify user intent into exactly one of these categories:\n"
+        "- 'booking': when user wants to book/schedule a new appointment\n"
+        "- 'cancelling': when user wants to cancel/delete an appointment\n"
+        "- 'rescheduling': when user wants to change/move an existing appointment's time\n"
+        "- 'general': for greetings, questions, or unclear intent\n"
+        "\n"
+        "IMPORTANT RULES:\n"
+        "1. Consider the FULL conversation context, not just the last message\n"
+        "2. If the conversation is already about booking/cancelling/rescheduling, stay in that context\n"
+        "3. Follow-up questions like 'yes', '3pm', 'Dr. Smith' should maintain the current intent\n"
+        "4. Only switch to 'general' if the user starts a completely new topic\n"
+        "5. Respond with ONLY the category name (e.g., 'booking', 'cancelling', 'rescheduling', or 'general')\n"
+        "6. Do not add any other text, explanations, or punctuation\n"
+        "7. If the user mentions they want to meet, cancel, or reschedule with a doctor, consider their intent clear and forward to the router."
+        "8. Only ask clarifying questions if the intent is ambiguous or not actionable."
+        "\n"
+        "Your response will be used directly by the system to route the user to the appropriate specialist."
+    )
+    return create_react_agent(model, tools, state_modifier=state_modifier)
+
+
 # -------- Router + Specialized Agents --------
 def build_general_agent():
     model = _init_model()
@@ -60,14 +87,26 @@ def build_booking_agent():
     model = _init_model()
     tools = [book_appointment, list_doctors]
     state_modifier = (
-        "You are the Appointment Booking Agent.\n"
-        "- Your job is to BOOK an appointment using the tool.\n"
-        "- Always ensure you have these fields before calling the tool: patient_name, doctor, time.\n"
-        "- If the doctor is missing or not found, call list_doctors (optionally with a department or name query) to suggest valid choices from the directory; never invent names.\n"
-        "- If doctor or preferred time are missing, ask for them (one short question at a time).\n"
-        "- If patient_name is missing, ask for it as well.\n"
-        "- The tool will validate the doctor name against the directory and refuse time conflicts.\n"
-        "- Once you have all required fields, call book_appointment and then confirm the booking succinctly."
+        "You are the Appointment Booking Agent."
+        "- Your job is to BOOK an appointment using the tools: `book_appointment` and `list_doctors`."
+        "- Always collect all required fields before calling any tool."
+  
+        "Required fields for `book_appointment`:  "
+        "   - patient_name"
+        "   - doctor"  
+        "   - time (use the current system time to avoid past times)"
+
+        "Required fields for `list_doctors`:"
+        "   - department (optional: doctor name query can also be used)"
+
+        "- Never assume or invent any value. Only use what the user provides."
+        "- If patient_name is missing, ask for it in one short question."
+        "- If doctor is missing or invalid, first ask the user for clarification in one short question. If needed, call `list_doctors` with available information (department or doctor name query) to suggest valid options."
+        "- If time is missing, ask for it in one short question."
+        "- If department is missing for `list_doctors`, first try to infer it from the patient’s symptoms. If the patient cannot provide symptoms or inference fails, default to 'General Medicine'."
+        "- Collect one piece of missing information at a time; do not ask multiple questions at once."
+        "- Once all required fields are collected for a tool, call it and handle the response appropriately."
+        "- After `book_appointment` succeeds, confirm the booking succinctly."
     )
     return create_react_agent(model, tools, state_modifier=state_modifier)
 
@@ -107,6 +146,7 @@ def build_graph():
     booking_agent = build_booking_agent()
     cancellation_agent = build_cancellation_agent()
     reschedule_agent = build_reschedule_agent()
+    router_agent = build_router_agent()
 
     def _extract_last_user_text(messages: List[Any]) -> str:
         for msg in reversed(messages):
@@ -119,35 +159,31 @@ def build_graph():
         return ""
 
     def route_decider(state: GraphState) -> Literal["general", "booking", "cancelling", "rescheduling"]:
-        logging.info(f"route_decider {pformat(state)}")
-        model = _init_model()
-        last_user = _extract_last_user_text(state.get("messages", []))
-        system = (
-            "You are a router that decides which specialist should handle the next turn.\n"
-            "Return exactly one token: 'general', 'booking', 'cancelling', or 'rescheduling'.\n"
-            "- 'booking' for booking or scheduling a new appointment.\n"
-            "- 'cancelling' for cancellation requests.\n"
-            "- 'rescheduling' when changing/moving an existing appointment's time.\n"
-            "- Otherwise 'general'."
-        )
-        resp = model.invoke([
-            ("system", system),
-            ("user", f"Message: {last_user}")
-        ])
-        logging.info(f"route_decider resp {resp}")
-        text = str(getattr(resp, "content", resp)).strip().lower()
-        # Heuristic override to prefer specialized nodes when intent words appear in the raw user text
-        raw = (last_user or "").lower()
+        logging.info(f"route_decider \n{pformat(state)}")
+        all_messages = state.get("messages", [])
+        
+        # Use the ReAct router agent with full conversation context
+        result = router_agent.invoke({"messages": all_messages}, config={"recursion_limit": 3})
+        logging.info(f"route_decider result \n{pformat(result['messages'][-1])}")
+        
+        # Extract the final response from the agent
+        messages = result.get("messages", [])
+        final_message = messages[-1] if messages else None
+        response_text = getattr(final_message, "content", "") if final_message else ""
+        response_text = str(response_text).strip().lower()
+        
+        # Parse the response to get the routing decision
         choice: str
-        if ("cancel" in text or "cancelling" in text) or ("cancel" in raw or "delete appointment" in raw):
+        if "cancelling" in response_text or "cancel" in response_text:
             choice = "cancelling"
-        elif ("resched" in text or "re-sched" in text or "move" in text or "change time" in text) or ("resched" in raw or "reschedule" in raw or "move" in raw):
+        elif "rescheduling" in response_text or "reschedule" in response_text:
             choice = "rescheduling"
-        elif ("book" in text or "appointment" in text or "schedule" in text) or ("book" in raw or "appointment" in raw or "schedule" in raw or "doctor" in raw):
+        elif "booking" in response_text or "book" in response_text:
             choice = "booking"
         else:
             choice = "general"
-        logging.info(f"route_decider choise: {choice}")
+            
+        logging.info(f"route_decider choice: \n{choice}")
         return choice  # type: ignore[return-value]
 
     def router_node(state: GraphState) -> GraphState:
@@ -182,16 +218,16 @@ def build_graph():
             logging.error(f"Failed to append chat record: {e}")
 
     def general_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: general {pformat(state)}")
+        logging.info(f"Running node: general \n{pformat(state)}")
         prev = state.get("messages", [])
         result = general_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
-        logging.info(f"Running node: general result {pformat(result)}")
+        logging.info(f"Running node: general result \n{pformat(result)}")
         msgs = result.get("messages", [])
         _append_chat_record("general", prev, msgs)
         return {"messages": msgs}
 
     def booking_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: booking {pformat(state)}")
+        logging.info(f"Running node: booking \n{pformat(state)}")
         prev = state.get("messages", [])
         result = booking_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
         msgs = result.get("messages", [])
@@ -199,7 +235,7 @@ def build_graph():
         return {"messages": msgs}
 
     def cancelling_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: cancelling {pformat(state)}")
+        logging.info(f"Running node: cancelling \n{pformat(state)}")
         prev = state.get("messages", [])
         result = cancellation_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
         msgs = result.get("messages", [])
@@ -207,7 +243,7 @@ def build_graph():
         return {"messages": msgs}
 
     def rescheduling_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: rescheduling {pformat(state)}")
+        logging.info(f"Running node: rescheduling \n{pformat(state)}")
         prev = state.get("messages", [])
         result = reschedule_agent.invoke({"messages": prev}, config={"recursion_limit": 5})
         msgs = result.get("messages", [])
