@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — Voice Desk</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect fill='%231a6b63' width='32' height='32' rx='8'/%3E%3Cpath fill='%23e8f6f3' d='M14 6h4v8h8v4h-8v8h-4v-8H6v-4h8z'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css?v=32" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <div id="banner" class="banner" hidden></div>
+
+  <header class="header">
+    <a class="back" href="/" title="Back">←</a>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>DBC Care</h1>
+        <p class="tag">Voice appointment line</p>
+      </div>
+    </div>
+    <div class="status-wrap">
+      <span id="status-dot" class="status-dot"></span>
+      <span id="status-label">disconnected</span>
+    </div>
+  </header>
+
+  <section class="hero-panel">
+    <p class="hero-kicker">Speak with the desk</p>
+    <h2 class="hero-title">Schedule visits without typing</h2>
+    <p class="hero-copy">Connect, then say what you need — new booking, cancel, or a new time.</p>
+  </section>
+
+  <section class="controls">
+    <label class="field">
+      <span>Call mode</span>
+      <select id="mode-select">
+        <option value="cascade">Cascade (Deepgram + DeepSeek)</option>
+        <option value="realtime">Realtime (OpenAI)</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Microphone</span>
+      <select id="mic-select" disabled>
+        <option value="">Default</option>
+      </select>
+    </label>
+  </section>
+
+  <main class="main">
+    <div class="meters">
+      <div class="meter" id="user-meter-wrap">
+        <div class="meter-head">
+          <span class="meter-label">You</span>
+          <span id="user-speak-state" class="meter-state">idle</span>
+        </div>
+        <div class="meter-bars" id="user-meter" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+      <div class="meter" id="bot-meter-wrap">
+        <div class="meter-head">
+          <span class="meter-label">Desk</span>
+          <span id="bot-speak-state" class="meter-state">idle</span>
+        </div>
+        <div class="meter-bars" id="bot-meter" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+    <p id="line-status" class="line-status" aria-live="polite">Disconnected</p>
+
+    <div id="transcript" class="transcript">
+      <div id="transcript-messages" class="transcript-messages">
+        <p class="hint">Press <strong>Connect</strong> to open the appointment line. Audio only — no camera.</p>
+      </div>
+      <div id="avg-response-panel" class="avg-panel" hidden aria-live="polite">
+        <div class="avg-row">
+          <span class="avg-label">Avg text</span>
+          <span id="avg-text-value" class="avg-value">—</span>
+        </div>
+        <div class="avg-row">
+          <span class="avg-label">Avg voice</span>
+          <span id="avg-voice-value" class="avg-value">—</span>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer class="toolbar">
+    <button id="btn-connect" type="button" class="btn primary">Connect</button>
+    <button id="btn-disconnect" type="button" class="btn" disabled>Disconnect</button>
+    <button id="btn-mic" type="button" class="btn" disabled title="Mute microphone">Mic on</button>
+  </footer>
+
+  <audio id="bot-audio" autoplay playsinline></audio>
+  <script type="module" src="app.js?v=32"></script>
+</body>
+</html>

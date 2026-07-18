@@ -1,7 +1,60 @@
+# --- Secrets & local config ---
 .env
-dataset
-chats
+.env.local
+.env.*.local
+admin_settings.json
+.admin_token_secret
+
+# --- Runtime data ---
+dataset/hospital.db
+dataset/hospital.db-*
+dataset/appointments.json
+dataset/patients.json
+dataset/prescriptions.json
+chats/
+metrics/
 app.log
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+*.egg
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# --- Virtual envs ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 *.xml
+
+# --- Misc / leftover scratch ---
 GraphApi.py
 FuctionalApi.py
+*.bak
+*.tmp

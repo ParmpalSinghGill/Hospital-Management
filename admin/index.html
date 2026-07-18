@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=12" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <section id="login-view" class="login-view is-active">
+    <div class="login-panel">
+      <div class="mark" aria-hidden="true"></div>
+      <h1>DBC Care Admin</h1>
+      <p class="sub">Credits, routing &amp; hospital records</p>
+      <form id="login-form">
+        <label>
+          <span>Username</span>
+          <input id="username" name="username" autocomplete="username" required />
+        </label>
+        <label>
+          <span>Password</span>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </label>
+        <p id="login-error" class="error" hidden></p>
+        <button type="submit">Sign in</button>
+      </form>
+      <a class="back-home" href="/">← Back to DBC Care</a>
+    </div>
+  </section>
+
+  <section id="admin-view" class="admin-view" hidden>
+    <header class="top">
+      <div class="brand-row">
+        <div class="mark sm" aria-hidden="true"></div>
+        <div>
+          <h1>Admin</h1>
+          <p class="sub">Signed in as <strong id="admin-user">Admin</strong></p>
+        </div>
+      </div>
+      <nav class="nav-bar" aria-label="Admin sections">
+        <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/appointments" data-nav="appointments">Appointments</a>
+        <a href="/admin/doctors" data-nav="doctors">Doctors</a>
+        <a href="/admin/patients" data-nav="patients">Patients</a>
+      </nav>
+      <div class="top-actions">
+        <a href="/">Home</a>
+        <button id="logout-btn" type="button" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>API credits &amp; status</h2>
+          <button id="refresh-credits" type="button" class="ghost">Refresh</button>
+        </div>
+        <p class="hint">Live balance when the provider exposes it (Deepgram needs an Owner/Admin key or <code>DEEPGRAM_MANAGE_API_KEY</code>; GLM uses Zhipu quota).</p>
+        <div id="credits" class="credits"></div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Service routing</h2>
+          <button id="save-settings" type="button" class="primary">Save</button>
+        </div>
+        <p class="hint">Choose which provider handles each part of the appointment system. Keys stay in <code>.env</code>.</p>
+        <form id="settings-form" class="settings">
+          <label>
+            <span>Speech-to-text (Cascade)</span>
+            <select id="stt" name="stt"></select>
+          </label>
+          <label>
+            <span>Text-to-speech (Cascade)</span>
+            <select id="tts" name="tts"></select>
+          </label>
+          <label>
+            <span>Cascade LLM</span>
+            <select id="cascade_llm" name="cascade_llm"></select>
+          </label>
+          <label>
+            <span>CLI / text chat LLM</span>
+            <select id="cli_llm" name="cli_llm"></select>
+          </label>
+          <label>
+            <span>Chat window backend (Cascade or Realtime)</span>
+            <select id="voice_pipeline_default" name="voice_pipeline_default"></select>
+          </label>
+          <label>
+            <span>Deepgram voice</span>
+            <input id="deepgram_voice" name="deepgram_voice" />
+          </label>
+          <label>
+            <span>GLM model</span>
+            <input id="glm_model" name="glm_model" />
+          </label>
+          <label>
+            <span>Groq model</span>
+            <input id="groq_model" name="groq_model" />
+          </label>
+          <label>
+            <span>DeepSeek model</span>
+            <input id="deepseek_model" name="deepseek_model" />
+          </label>
+          <label>
+            <span>OpenAI Realtime model</span>
+            <input id="openai_realtime_model" name="openai_realtime_model" />
+          </label>
+          <label>
+            <span>OpenAI Realtime voice</span>
+            <select id="openai_realtime_voice" name="openai_realtime_voice"></select>
+          </label>
+          <label class="toggle-row">
+            <span>Debugging mode</span>
+            <input id="debug_mode" name="debug_mode" type="checkbox" />
+          </label>
+          <p class="hint tight">When on, the chat UI shows send time, first text token time, and first spoken word time.</p>
+        </form>
+        <p id="save-msg" class="save-msg" hidden></p>
+      </article>
+
+      <article class="panel span-2">
+        <div class="panel-head">
+          <h2>Hospital records</h2>
+        </div>
+        <p class="hint">Browse upcoming appointments by department/doctor, or open the patient directory.</p>
+        <div class="quick-links">
+          <a class="quick-card" href="/admin/appointments">
+            <strong>Appointments</strong>
+            <span>Browse upcoming visits by department and doctor.</span>
+          </a>
+          <a class="quick-card" href="/admin/doctors">
+            <strong>Doctors</strong>
+            <span>Day grid, lunch break, and mark unavailable times.</span>
+          </a>
+          <a class="quick-card" href="/admin/patients">
+            <strong>Patients</strong>
+            <span>Search records, visits, prescriptions, and chats.</span>
+          </a>
+        </div>
+      </article>
+    </main>
+  </section>
+
+  <script src="/admin/static/common.js?v=8"></script>
+  <script src="/admin/static/app.js?v=6"></script>
+</body>
+</html>

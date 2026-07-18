@@ -1,0 +1,25 @@
+[project]
+name = "hospital-ai-assistant"
+version = "0.1.0"
+description = "Hospital appointment voice agent (Cascade Deepgram+GLM / OpenAI Realtime)"
+requires-python = ">=3.11"
+dependencies = [
+    "pipecat-ai[daily,deepgram,openai,runner,silero,webrtc]>=1.4.0",
+    "langgraph>=0.2.40",
+    "langchain-core>=0.3.10",
+    "langchain-groq>=0.1.5",
+    "langchain-openai>=0.2.0",
+    "python-dotenv>=1.0.1",
+    "loguru>=0.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.404,<2",
+    "ruff>=0.12.11,<1",
+]
+
+[tool.ruff]
+line-length = 100
+[tool.ruff.lint]
+select = ["I", "UP"]
