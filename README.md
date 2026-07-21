@@ -9,6 +9,8 @@ or OpenAI Realtime voice pipelines and a password-protected Admin console.
 ## Features
 
 - **Text CLI** — interactive booking desk (`Main.py`)
+- **Telegram bot** — book / cancel / reschedule over Telegram (`telegram_bot.py`)
+- **MCP server** — same tools for ChatGPT / Cursor (`mcp_server.py`)
 - **Voice Cascade** — Deepgram STT → LangGraph (DeepSeek by default) → Deepgram TTS
 - **Voice Realtime** — OpenAI Realtime speech-to-speech + appointment tools
 - **Web UIs** — Chat & Call (`/app/`), Voice Desk (`/app-lite/`), home chooser (`/`)
@@ -21,12 +23,14 @@ or OpenAI Realtime voice pipelines and a password-protected Admin console.
 ## Architecture
 
 ```
-User (text / voice)
+User (text / voice / Telegram)
         │
         ├─ CLI ──────────────► Main.py LangGraph (router → booking/cancel/reschedule)
         │                              │
         │                              ▼
         │                         Tools.py ──► dataset/hospital.db (SQLite)
+        │
+        ├─ Telegram (telegram_bot.py) ─► same LangGraph + Tools.py
         │
         └─ Voice (bot.py)
                ├─ Cascade: Deepgram → same LangGraph → Deepgram
@@ -44,14 +48,35 @@ User (text / voice)
 | `reschedule_appointment` | Move to a new time if free |
 | `get_prescriptions` | Look up medicines (id, or name+phone together) |
 
+### Tool discovery for external systems
+
+After `python bot.py`, any external system can fetch tool metadata over HTTP
+(same server as the web UI — default **http://localhost:7860**):
+
+| URL | Purpose |
+|-----|---------|
+| `/api/tools` | JSON catalog: name, description, JSON Schema parameters, which agents use each tool |
+| `/api/tools/{name}` | One tool, e.g. `/api/tools/book_appointment` |
+| `/toollist/` | Human-readable HTML table + full JSON |
+
+Example:
+
+```bash
+curl -s http://localhost:7860/api/tools | jq .
+curl -s http://localhost:7860/api/tools/book_appointment | jq .
+```
+
+These routes expose **metadata only** (discovery). They do not execute tools.
+
+To let ChatGPT (or Cursor) **discover and call** the same `Tools.py` tools, run the **MCP server** below.
+
 ### Data
 
 | Store | Contents |
 |-------|----------|
 | `dataset/hospital.db` | SQLite DB: `doctors`, `patients`, `appointments`, `prescriptions` |
-| `dataset/*.json` (optional) | Legacy files; imported once if the DB is empty |
 
-Tables mirror the old JSON shape (`doctor_id`, `patient_id`, `APT-XXXX`, `RX-XXXX`, status, time as `YYYY-MM-DD HH:MM`).
+Tables use ids like `doctor_id`, `patient_id`, `APT-XXXX`, `RX-XXXX`, plus status and time as `YYYY-MM-DD HH:MM`.
 
 ---
 
@@ -111,6 +136,8 @@ Copy `.env.example` → `.env`. Never commit `.env`.
 | `BOT_MODE` | Voice default | `cascade` or `realtime` |
 | `ADMIN_USER` / `ADMIN_PASS` | Admin login | Defaults `Admin` / `12345` |
 | `DAILY_API_KEY` | Optional | Daily transport for production |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot | From [@BotFather](https://t.me/BotFather) — book/cancel/reschedule via chat |
+| `MCP_TRANSPORT` / `MCP_HOST` / `MCP_PORT` | `mcp_server.py` | Optional defaults for remote MCP (`streamable-http`, `127.0.0.1`, `8000`) |
 
 Admin settings also persist to `admin_settings.json` (gitignored).
 
@@ -133,6 +160,7 @@ Open **http://localhost:7860/app/**
 | `/admin/` | Select Cascade vs Realtime, LLM/STT/TTS, debug mode |
 | `/` | Home links |
 | `/app-lite/` | Optional lean voice-only page |
+| `/toollist/` | Tool catalog (HTML); JSON at `/api/tools` |
 
 Flow:
 
@@ -145,6 +173,96 @@ Optional developer CLI (same tools, no web UI):
 ```bash
 python Main.py
 ```
+
+### Telegram booking bot
+
+Same LangGraph booking/cancel/reschedule tools, over Telegram text chat.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and put the token in `.env` as `TELEGRAM_BOT_TOKEN=...`
+2. Run:
+
+```bash
+conda activate hosmanag
+python telegram_bot.py
+```
+
+3. Open Telegram, message your bot, and say e.g. “book a dental appointment tomorrow at 11 AM”.
+
+Commands: `/start`, `/help`, `/reset` (fresh conversation). Chats are logged under `chats/` with channel `telegram`.
+
+### MCP server (ChatGPT / Cursor — discover + call tools)
+
+Same `Tools.py` tools (no duplicates). MCP clients call `tools/list` then `tools/call`
+(book / cancel / reschedule, etc.).
+
+```bash
+conda activate hosmanag
+pip install -r requirements.txt   # includes mcp[cli]
+
+# List what will be registered
+python mcp_server.py --list-tools
+
+# Local MCP (Cursor / Claude Desktop) — stdio
+python mcp_server.py
+
+# Remote MCP for ChatGPT via Cloudflare (separate terminal)
+python mcp_server.py --transport streamable-http --host 127.0.0.1 --port 8000
+# or legacy SSE:
+# python mcp_server.py --transport sse --host 127.0.0.1 --port 8000
+```
+
+Expose with Cloudflare Tunnel:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+In **ChatGPT → Settings → Developer mode** (plan-dependent), create an app and paste:
+
+| Purpose | URL |
+|---------|-----|
+| **Browser (human check)** | `https://<your-tunnel>/` |
+| JSON tool list | `https://<your-tunnel>/toollist` |
+| Health | `https://<your-tunnel>/health` |
+| Recent tool-call audit | `https://<your-tunnel>/tool-calls?limit=50` |
+| **ChatGPT MCP (paste this)** | `https://<your-tunnel>/mcp` |
+| SSE (legacy) | `https://<your-tunnel>/sse` |
+
+Every MCP (and voice/web LangGraph) tool invocation is appended to
+`chats/tool_call.json` with timestamp, tool name, arguments, result, duration,
+and source (`mcp` / `langgraph` / `realtime`). Session chat text stays in
+`chats/sessions/`; tool audits are linked by optional `session_id`.
+
+Example with a trycloudflare host: open
+`https://xxxx.trycloudflare.com/` in Chrome; paste
+`https://xxxx.trycloudflare.com/mcp` into ChatGPT.
+
+Restart MCP after pulling updates (`--allow-tunnel` is on by default so Cloudflare Host headers work).
+
+#### ChatGPT auth error (“Couldn’t register with … sign-in service”)
+
+ChatGPT tried **OAuth registration**, but the server had no sign-in service.
+
+**Option A (simplest):** when creating the connector/app, set authentication to **No Authentication** (not OAuth). Paste `https://<tunnel>/mcp`.
+
+**Option B:** run MCP with the demo OAuth provider (supports ChatGPT Dynamic Client Registration):
+
+```bash
+python mcp_server.py --transport streamable-http --host 127.0.0.1 --port 8000 \
+  --allow-tunnel --oauth \
+  --public-url https://YOUR_TUNNEL.trycloudflare.com
+```
+
+Use the **same** tunnel hostname in `--public-url` and in ChatGPT. Then reconnect the app (OAuth OK).
+Demo OAuth is for local/dev only — not production.
+
+ChatGPT will list all tools and can call `book_appointment` (confirm write actions when prompted).
+
+**Notes**
+
+- Local stdio MCP cannot be reached from chatgpt.com — use **streamable-http/SSE + tunnel**.
+- Protect the public URL (Cloudflare Access / auth) before production; booking tools write to your DB.
+- `bot.py` (port 7860) and `mcp_server.py` (port 8000) are separate processes; both use the same `Tools.py` + SQLite.
 
 ### Admin
 
@@ -198,7 +316,7 @@ python MakeDataBase.py 2026-07-16 2026-07-20 --range --per-doctor 3
 ```
 
 Slots are **10 minutes** by default (09:00–17:00). Patients and prescriptions live in SQLite and are referenced by `patient_id`.  
-Running the seeder does **not** happen automatically when the bot starts. On first run with an empty DB, existing `dataset/*.json` files are migrated automatically.
+Running the seeder does **not** happen automatically when the bot starts.
 
 ---
 
@@ -215,6 +333,8 @@ Hospital_Ai_Assistent/
 │
 ├── bot.py                  # Voice entry (Cascade + Realtime)
 ├── bot_realtime.py         # Realtime shortcut
+├── telegram_bot.py         # Telegram text booking bot
+├── mcp_server.py           # MCP server (ChatGPT/Cursor) — wraps Tools.py
 ├── voice.py                # Alias entry
 ├── voice_bridge.py         # Bridge Main/Tools ↔ Pipecat
 │
@@ -225,12 +345,16 @@ Hospital_Ai_Assistent/
 ├── client/                 # Chat & Call UI (/app/)
 ├── client-lite/            # Voice Desk UI (/app-lite/)
 │
-├── dataset/                # hospital.db (+ optional legacy *.json for migration)
+├── dataset/                # hospital.db (SQLite)
 ├── turn_metrics.py         # Latency metrics (CSV) + feeds call JSON
 ├── conversation_log.py     # Per-call JSON conversation + timings
 ├── log_routes.py           # Client timing ingest API
+├── tool_catalog.py         # Tool metadata for discovery APIs
+├── tool_routes.py          # GET /api/tools, /toollist/
 ├── session_turn.py         # Turn helpers for metrics
-├── chats/                  # call-*.json logs (gitignored)
+├── chats/
+│   ├── sessions/           # one sess-*.json per call (gitignored)
+│   └── tool_call.json      # all tool-call audits
 ├── requirements.txt
 ├── pyproject.toml
 ├── .env.example
@@ -241,9 +365,14 @@ Hospital_Ai_Assistent/
 
 ## Call / chat logs
 
-Each web or CLI session writes a JSON file under ``chats/``::
+Each web or CLI session writes a JSON file under ``chats/sessions/``::
 
-    chats/sess-YYYYMMDD-HHMMSS_<session_id>.json
+    chats/sessions/sess-YYYYMMDD-HHMMSS_<session_id>.json
+
+All tool invocations (any channel) are stored in one file::
+
+    chats/tool_call.json
+
 
 Schema (one file per session)::
 

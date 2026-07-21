@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — Doctors</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=12" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="top">
+      <div class="brand-row">
+        <a class="mark sm" href="/admin/" aria-label="Admin home"></a>
+        <div>
+          <h1>Doctors</h1>
+          <p class="sub">Signed in as <strong id="admin-user">Admin</strong></p>
+        </div>
+      </div>
+      <nav class="nav-bar" aria-label="Admin sections">
+        <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/appointments" data-nav="appointments">Appointments</a>
+        <a href="/admin/doctors" data-nav="doctors">Doctors</a>
+        <a href="/admin/patients" data-nav="patients">Patients</a>
+      </nav>
+      <div class="top-actions">
+        <a href="/">Home</a>
+        <button id="logout-btn" type="button" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Doctor directory</h2>
+        <button id="refresh-doctors" type="button" class="ghost">Refresh</button>
+      </div>
+      <p class="hint">Clinic hours are 9:00 AM–5:00 PM. Open a doctor to see their day grid, lunch break (2–3 PM), and mark other unavailable times.</p>
+      <div class="filters">
+        <label>
+          <span>Department</span>
+          <select id="filter-department">
+            <option value="">All departments</option>
+          </select>
+        </label>
+      </div>
+      <p id="doctor-meta" class="hint"></p>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Name</th>
+              <th>Department</th>
+            </tr>
+          </thead>
+          <tbody id="doctor-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script src="/admin/static/common.js?v=8"></script>
+  <script src="/admin/static/doctors.js?v=2"></script>
+</body>
+</html>

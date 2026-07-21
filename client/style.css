@@ -180,6 +180,22 @@ body {
   background: var(--surface);
   max-width: 16rem;
 }
+.new-patient-btn {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--teal-deep);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.45rem 0.75rem;
+  border-radius: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.new-patient-btn:hover {
+  border-color: var(--teal-deep);
+  background: rgba(26, 107, 99, 0.06);
+}
 #backend-label {
   font-size: 0.8rem;
   font-weight: 600;

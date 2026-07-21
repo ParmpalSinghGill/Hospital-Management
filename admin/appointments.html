@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — Appointments</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=12" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="top">
+      <div class="brand-row">
+        <a class="mark sm" href="/admin/" aria-label="Admin home"></a>
+        <div>
+          <h1>Appointments</h1>
+          <p class="sub">Signed in as <strong id="admin-user">Admin</strong></p>
+        </div>
+      </div>
+      <nav class="nav-bar" aria-label="Admin sections">
+        <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/appointments" data-nav="appointments">Appointments</a>
+        <a href="/admin/doctors" data-nav="doctors">Doctors</a>
+        <a href="/admin/patients" data-nav="patients">Patients</a>
+      </nav>
+      <div class="top-actions">
+        <a href="/">Home</a>
+        <button id="logout-btn" type="button" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Upcoming schedule</h2>
+        <button id="refresh-appts" type="button" class="ghost">Refresh</button>
+      </div>
+      <p class="hint">Choose a department and doctor to list appointments from now onward. Click a doctor name for their schedule, or a card/patient to open the patient record.</p>
+
+      <div class="filters">
+        <label>
+          <span>Department</span>
+          <select id="filter-department">
+            <option value="">All departments</option>
+          </select>
+        </label>
+        <label>
+          <span>Doctor</span>
+          <select id="filter-doctor">
+            <option value="">All doctors</option>
+          </select>
+        </label>
+      </div>
+
+      <p id="appt-meta" class="meta-line"></p>
+      <div id="appt-list" class="appt-grid"></div>
+    </section>
+  </div>
+
+  <script src="/admin/static/common.js?v=8"></script>
+  <script src="/admin/static/appointments.js?v=7"></script>
+</body>
+</html>

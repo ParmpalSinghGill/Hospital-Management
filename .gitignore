@@ -8,9 +8,7 @@ admin_settings.json
 # --- Runtime data ---
 dataset/hospital.db
 dataset/hospital.db-*
-dataset/appointments.json
-dataset/patients.json
-dataset/prescriptions.json
+dataset/*.json
 chats/
 metrics/
 app.log

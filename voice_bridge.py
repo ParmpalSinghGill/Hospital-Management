@@ -122,7 +122,7 @@ def make_langgraph_processor(
         LLMContextFrame,
         LLMFullResponseEndFrame,
         LLMFullResponseStartFrame,
-        LLMTextFrame,
+        OutputTransportMessageUrgentFrame,
         TTSSpeakFrame,
         UninterruptibleFrame,
     )
@@ -134,10 +134,6 @@ def make_langgraph_processor(
     # Keep reply text/audio in the queue if an InterruptionFrame arrives mid-push.
     @dataclass
     class GuardedLLMFullResponseStartFrame(LLMFullResponseStartFrame, UninterruptibleFrame):
-        pass
-
-    @dataclass
-    class GuardedLLMTextFrame(LLMTextFrame, UninterruptibleFrame):
         pass
 
     @dataclass
@@ -171,12 +167,22 @@ def make_langgraph_processor(
             state["last_bot_text"] = reply
             start = GuardedLLMFullResponseStartFrame()
             start.skip_tts = True
-            text = GuardedLLMTextFrame(reply)
-            text.skip_tts = True
             end = GuardedLLMFullResponseEndFrame()
             end.skip_tts = True
+            # Chat bubble via one channel only (server-message). Do NOT also push
+            # LLMTextFrame — that duplicated every reply in the UI (LLM text +
+            # server-message). Start/End still fire for turn metrics / RTVI.
+            await self.push_frame(
+                OutputTransportMessageUrgentFrame(
+                    message={
+                        "label": "rtvi-ai",
+                        "type": "server-message",
+                        "data": {"type": "bot_chat_text", "text": reply},
+                    }
+                ),
+                direction,
+            )
             await self.push_frame(start, direction)
-            await self.push_frame(text, direction)
             await self.push_frame(end, direction)
             await self.push_frame(
                 GuardedTTSSpeakFrame(text=reply, append_to_context=False),
@@ -190,41 +196,16 @@ def make_langgraph_processor(
             state["last_user_text"] = user_text
             state["busy"] = True
             logger.info(f"LangGraph turn ({thread_id}): {user_text!r}")
-            # Shield inference from Pipecat barge-in cancellation. A quick
-            # follow-up utterance (e.g. duplicate "Yes.") otherwise cancels
-            # this coroutine, drops the reply, and leaves the call silent —
-            # even though the agent thread finished (save_patient, etc.).
-            turn_task = asyncio.create_task(
-                asyncio.to_thread(
-                    run_turn,
-                    graph_app,
-                    user_text,
-                    thread_id,
-                    call_id=log_call_id,
-                )
+            # Run inference off the process-frame task. If we await here inside
+            # process_frame and swallow CancelledError, Pipecat's barge-in waits
+            # forever for the process task to exit → dead silence.
+            turn_result = await asyncio.to_thread(
+                run_turn,
+                graph_app,
+                user_text,
+                thread_id,
+                call_id=log_call_id,
             )
-            while not turn_task.done():
-                try:
-                    await asyncio.shield(turn_task)
-                except asyncio.CancelledError:
-                    logger.debug(
-                        "Interrupt during LangGraph turn; keeping inference"
-                    )
-                    try:
-                        from conversation_log import record_interrupt
-
-                        record_interrupt(
-                            log_call_id,
-                            reason="interrupt_during_inference",
-                            user_text=user_text,
-                            bot_text=str(state.get("last_bot_text") or ""),
-                            phase="agent_busy",
-                            strategy="CancelledError",
-                        )
-                    except Exception:
-                        pass
-                    continue
-            turn_result = turn_task.result()
             reply = getattr(turn_result, "text", None) or str(turn_result or "")
             agent = getattr(turn_result, "agent", "") or ""
             reply = sanitize_assistant_reply(reply or "")
@@ -234,25 +215,35 @@ def make_langgraph_processor(
                 logger.info(f"LangGraph reply via [{agent}]: {reply!r}")
             else:
                 logger.info(f"LangGraph reply: {reply!r}")
-            try:
-                await self._push_spoken_reply(reply, direction)
-            except asyncio.CancelledError:
-                # Still force the spoken reply out after a barge-in cancel.
-                logger.debug("TTS push interrupted; retrying spoken reply once")
-                try:
-                    from conversation_log import record_interrupt
+            await self._push_spoken_reply(reply, direction)
 
-                    record_interrupt(
-                        log_call_id,
-                        reason="interrupt_during_tts_push",
-                        user_text=user_text,
-                        bot_text=reply,
-                        phase="tts_push",
-                        strategy="CancelledError",
-                    )
-                except Exception:
-                    pass
-                await self._push_spoken_reply(reply, direction)
+        async def _drain_turns(self, first_text: str, direction: FrameDirection) -> None:
+            """Background turn loop — must not run on Pipecat's process-frame task."""
+            try:
+                next_text = first_text
+                while next_text:
+                    try:
+                        await self._run_one_turn(next_text, direction)
+                    except Exception as e:
+                        logger.exception("LangGraph turn failed")
+                        err = f"Sorry, something went wrong: {e}"
+                        try:
+                            await self._push_spoken_reply(err, direction)
+                        except Exception:
+                            logger.exception("Failed to speak LangGraph error")
+                    pending = (self._pending_user_text or "").strip()
+                    self._pending_user_text = ""
+                    if not pending or pending == next_text:
+                        break
+                    if (
+                        pending == self._last_user_text
+                        and (time.monotonic() - self._last_user_at) < 2.0
+                    ):
+                        break
+                    next_text = pending
+            finally:
+                self._busy = False
+                state["busy"] = False
 
         async def process_frame(self, frame: Frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
@@ -290,33 +281,14 @@ def make_langgraph_processor(
                         pass
                     return
 
+                # Return immediately so barge-in can cancel/recreate the process
+                # task while LangGraph keeps running in the background.
                 self._busy = True
                 state["busy"] = True
-                try:
-                    next_text = user_text
-                    while next_text:
-                        try:
-                            await self._run_one_turn(next_text, direction)
-                        except Exception as e:
-                            logger.exception("LangGraph turn failed")
-                            err = f"Sorry, something went wrong: {e}"
-                            try:
-                                await self._push_spoken_reply(err, direction)
-                            except asyncio.CancelledError:
-                                pass
-                        pending = (self._pending_user_text or "").strip()
-                        self._pending_user_text = ""
-                        if not pending or pending == next_text:
-                            break
-                        if (
-                            pending == self._last_user_text
-                            and (time.monotonic() - self._last_user_at) < 2.0
-                        ):
-                            break
-                        next_text = pending
-                finally:
-                    self._busy = False
-                    state["busy"] = False
+                self.create_task(
+                    self._drain_turns(user_text, direction),
+                    name="hospital_langgraph_turn",
+                )
                 return
 
             await self.push_frame(frame, direction)
@@ -356,6 +328,13 @@ def hospital_function_schemas():
                 "phone": {"type": "string", "description": "Patient phone number."},
                 "patient_name": {"type": "string", "description": "Full name for verification."},
                 "patient_id": {"type": "string", "description": "Optional id like PAT-0001."},
+                "department": {
+                    "type": "string",
+                    "description": (
+                        "Optional specialty after symptoms are known. Returns booking_guidance: "
+                        "inform_existing_soon, offer_prepone, or offer_new_booking."
+                    ),
+                },
             },
             required=[],
         ),
@@ -437,19 +416,41 @@ def register_hospital_tools_on_llm(llm) -> list:
     for name, lc_tool in _LC_TOOLS.items():
 
         async def _handler(params: FunctionCallParams, _tool=lc_tool, _name=name):
+            import time
+
             args = dict(params.arguments or {})
             logger.info(f"Realtime tool {_name} args={args}")
+            t0 = time.perf_counter()
+            error = ""
+            data: Any = None
             try:
                 raw = await asyncio.to_thread(_tool.invoke, args)
+                try:
+                    data = json.loads(raw) if isinstance(raw, str) else raw
+                except json.JSONDecodeError:
+                    data = {"raw": raw}
+                await params.result_callback(data)
             except Exception as e:
                 logger.exception(f"Tool {_name} failed")
-                await params.result_callback({"ok": False, "message": str(e)})
-                return
+                error = str(e)
+                data = {"ok": False, "message": error}
+                await params.result_callback(data)
             try:
-                data = json.loads(raw) if isinstance(raw, str) else raw
-            except json.JSONDecodeError:
-                data = {"raw": raw}
-            await params.result_callback(data)
+                from conversation_log import get_current_call_id, record_tool_call
+
+                record_tool_call(
+                    tool=_name,
+                    arguments=args,
+                    result=data if not error else None,
+                    source="realtime",
+                    call_id=get_current_call_id() or None,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    ok=False if error else None,
+                    error=error,
+                    tool_call_id=str(getattr(params, "tool_call_id", "") or ""),
+                )
+            except Exception:
+                pass
 
         llm.register_function(name, _handler)
 
@@ -457,14 +458,18 @@ def register_hospital_tools_on_llm(llm) -> list:
 
 
 REALTIME_SYSTEM = (
-    "You are a hospital appointment assistant on a live voice call. "
-    "Sound natural and concise. Use tools for looking up patients, booking, cancelling, "
-    "rescheduling, listing doctors, and prescriptions — never invent IDs, doctor names, or medicines. "
-    "Ask for one missing field at a time. Always confirm phone and name out loud and wait for yes "
-    "before lookup or booking. Patients often forget their id — verify with phone and name only. "
-    "NEVER ask for date of birth, age, or government ID. If they offer DOB, say you only need phone and name. "
-    "For returning patients, mention their last doctor and ask if they want the same one. "
-    "If same doctor, only ask day and time. If a new health issue, pick another department. "
-    "If they want a second opinion or a new doctor, list other doctors in the same department. "
-    "Confirm results briefly. No markdown, bullets, or emojis."
+    "You are a warm hospital front-desk assistant on a live voice call. "
+    "Sound like a real person — soft, brief, never like a menu. "
+    "FLOW: greet first ('Hi, how can I help you today?'); if need unclear ask "
+    "'What brings you in today?' — NEVER list book/cancel/reschedule/prescriptions. "
+    "When intent is clear from natural speech, acknowledge and ask phone; confirm phone; "
+    "confirm name from lookup or collect+save for new patients; then help using intent + history. "
+    "If they already have a visit, tell them and offer to keep/move/cancel. "
+    "If not, offer to set one up softly. Medicine/timing questions → get_prescriptions. "
+    "Use tools for lookup, booking, cancel, reschedule, doctors, prescriptions — never invent IDs. "
+    "One short sentence per turn. Good: 'What brings you in today?' / "
+    "'Sorry about that. What's your phone number?' "
+    "Never identify a patient from chat memory alone. Never look up by name alone. "
+    "After verified registration, call lookup_patient with department and follow booking_guidance. "
+    "NEVER ask for DOB, age, or government ID. No markdown, bullets, or emojis."
 )

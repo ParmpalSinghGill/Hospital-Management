@@ -422,6 +422,7 @@ def _mount_custom_client() -> None:
 
     from admin_routes import router as admin_router
     from log_routes import router as log_router
+    from tool_routes import router as tool_router
 
     app.mount("/app", StaticFiles(directory=_ROOT / "client", html=True), name="custom-client")
     app.mount(
@@ -436,6 +437,7 @@ def _mount_custom_client() -> None:
     )
     app.include_router(admin_router)
     app.include_router(log_router)
+    app.include_router(tool_router)
 
     @app.get("/", include_in_schema=False)
     async def root_chooser():

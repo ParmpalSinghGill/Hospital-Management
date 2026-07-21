@@ -8,6 +8,7 @@ const banner = document.getElementById("banner");
 const statusDot = document.getElementById("status-dot");
 const statusText = document.getElementById("status-text");
 const backendLabel = document.getElementById("backend-label");
+const newPatientBtn = document.getElementById("new-patient-btn");
 const micSelect = document.getElementById("mic-select");
 const voiceMicSelect = document.getElementById("voice-mic-select");
 const chatEl = document.getElementById("chat");
@@ -101,6 +102,8 @@ let voiceResponseTimesMs = [];
 let turnMode = null;
 let userTurnPending = false;
 let botTextSource = null;
+/** Last bot reply shown in chat — survives bubble finalize so TTS can't re-add it. */
+let lastShownBotText = "";
 let debugMode = false;
 let pipelineMode = "cascade";
 let lastUserMsgEl = null;
@@ -137,6 +140,44 @@ function getOrCreateThreadId() {
     return id;
   } catch {
     return `thread_${getOrCreateUserId()}`;
+  }
+}
+
+/** Wipe browser session so the next connect is a fresh LangGraph thread (new patient). */
+function resetSessionIdentity() {
+  try {
+    localStorage.removeItem(USER_ID_KEY);
+    localStorage.removeItem(THREAD_ID_KEY);
+  } catch {
+    /* ignore */
+  }
+  return {
+    userId: getOrCreateUserId(),
+    threadId: getOrCreateThreadId(),
+  };
+}
+
+async function startNewPatientSession() {
+  const ok = window.confirm(
+    "Start as a new patient?\n\nThis clears the chat and agent memory in this browser. Use a different phone/name when registering."
+  );
+  if (!ok) return;
+  try {
+    newPatientBtn && (newPatientBtn.disabled = true);
+    await disconnectAndReset();
+    clearTranscript();
+    const ids = resetSessionIdentity();
+    callId = null;
+    addMessage(
+      "system",
+      `New patient session ready (${ids.threadId}). Say hello and register with a phone number.`
+    );
+    if (welcomeStrip) welcomeStrip.hidden = true;
+    showBanner("Started a new patient session — previous chat memory cleared.");
+  } catch (err) {
+    showBanner("Could not reset session: " + (err?.message || err));
+  } finally {
+    if (newPatientBtn) newPatientBtn.disabled = false;
   }
 }
 
@@ -371,6 +412,8 @@ function beginTurnTiming(mode) {
   turnVoiceAt = null;
   turnMode = mode;
   userTurnPending = true;
+  // Allow the next bot reply even if it matches the previous wording.
+  lastShownBotText = "";
 }
 
 function addMessage(role, text, { sentAt = null } = {}) {
@@ -403,6 +446,7 @@ function clearTranscript() {
   voiceResponseTimesMs = [];
   resetTurnTiming();
   botTextSource = null;
+  lastShownBotText = "";
   if (welcomeStrip) welcomeStrip.hidden = false;
   updateAvgResponse();
 }
@@ -426,6 +470,8 @@ function clearConnectingMessage() {
 }
 
 function beginAssistantTurn() {
+  if (assistantEl) return;
+  hideWelcome();
   const wrap = document.createElement("div");
   wrap.className = "msg assistant";
   const bubble = document.createElement("div");
@@ -443,17 +489,42 @@ function beginAssistantTurn() {
 function appendAssistantText(chunk) {
   if (!chunk) return;
   if (!assistantEl) beginAssistantTurn();
-  const wasEmpty = !assistantEl.textContent;
+  const current = assistantEl.textContent || "";
+  // Same full reply delivered on LLM + TTS + server-message channels.
+  if (current === chunk || current.endsWith(chunk)) return;
+  if (chunk.startsWith(current) && chunk.length > current.length) {
+    assistantEl.textContent = chunk;
+    if (!current) recordTextLatency();
+    updateVoiceCaption(assistantEl.textContent);
+    scrollToBottom();
+    return;
+  }
+  const wasEmpty = !current;
   assistantEl.textContent += chunk;
   if (wasEmpty) recordTextLatency();
   updateVoiceCaption(assistantEl.textContent);
   scrollToBottom();
 }
 
-function finalizeAssistantTurn() {
+function normalizeBotBubbleText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isDuplicateBotText(incoming, existing) {
+  if (!incoming || !existing) return false;
+  if (incoming === existing) return true;
+  // TTS often re-sends the same reply in chunks after the first bubble closed.
+  if (existing.startsWith(incoming) || incoming.startsWith(existing)) return true;
+  return false;
+}
+
+function finalizeAssistantTurn({ removeIfEmpty = false } = {}) {
   const hadText = Boolean(assistantEl?.textContent?.trim());
   const finalText = assistantEl?.textContent || "";
   if (hadText) {
+    lastShownBotText = normalizeBotBubbleText(finalText);
     logClientEvent("bot_text_complete", {
       at_ms: Date.now(),
       text: finalText,
@@ -461,22 +532,49 @@ function finalizeAssistantTurn() {
   }
   if (debugMode) renderAssistantDebug(assistantWrap);
   if (assistantWrap) lastAssistantWrap = assistantWrap;
-    if (assistantEl) {
+  if (assistantEl) {
     assistantEl.classList.remove("pending");
     const wrap = assistantEl.closest(".msg.assistant");
-    // Don't delete the bubble if bot is still speaking / about to speak —
-    // interruptions often fire onBotLlmStopped before text arrives.
-    if (!hadText && !voiceLatencyRecorded && !botSpeaking) {
+    // LLM stop often arrives before bot-llm-text / bot-tts-text. Keep the
+    // empty bubble open until speech ends (or we explicitly clean up).
+    if (!hadText && removeIfEmpty) {
       wrap?.remove();
       if (wrap === lastAssistantWrap) lastAssistantWrap = null;
       if (assistantEl === lastAssistantEl) lastAssistantEl = null;
     }
   }
-  assistantEl = null;
-  assistantWrap = null;
+  // If the bubble is still empty and we're not removing it, keep assistantEl
+  // so late TTS/output text can fill the same bubble.
+  if (hadText || removeIfEmpty || !assistantEl) {
+    assistantEl = null;
+    assistantWrap = null;
+    botTextSource = null;
+  }
   if (hadText || voiceLatencyRecorded) {
     resetTurnTiming();
   }
+}
+
+function ingestBotText(text, source) {
+  if (!text) return;
+  const normalized = normalizeBotBubbleText(text);
+  if (!normalized) return;
+
+  const active = normalizeBotBubbleText(assistantEl?.textContent || "");
+  if (
+    isDuplicateBotText(normalized, active) ||
+    isDuplicateBotText(normalized, lastShownBotText)
+  ) {
+    if (!botTextSource) botTextSource = source;
+    return;
+  }
+  // Prefer the first non-empty channel; ignore duplicates from later channels.
+  if (botTextSource && botTextSource !== source && active) {
+    return;
+  }
+  botTextSource = source;
+  appendAssistantText(text);
+  lastShownBotText = normalizeBotBubbleText(assistantEl?.textContent || normalized);
 }
 
 function setOrbState(state) {
@@ -843,23 +941,28 @@ function buildClient() {
       onMessageError: (message) => console.error("RTVI message error", message),
       onBotLlmStarted: () => {
         llmStreaming = true;
-        botTextSource = null;
-        beginAssistantTurn();
+        // Do not open an empty bubble here — wait for real text
+        // (bot_chat_text). Opening early + TTS replay caused duplicates.
       },
       onBotLlmText: (data) => {
-        botTextSource = "llm";
-        const text = data?.text ?? data?.content ?? "";
-        if (text) appendAssistantText(text);
+        ingestBotText(data?.text ?? data?.content ?? "", "llm");
       },
       onBotOutput: (data) => {
-        if (botTextSource === "llm") return;
-        const text = data?.text ?? "";
-        if (!text) return;
-        botTextSource = "output";
-        appendAssistantText(text);
+        ingestBotText(data?.text ?? "", "output");
+      },
+      onBotTtsText: () => {
+        // Cascade chat text comes from bot_chat_text. TTS text is the same
+        // reply again (often after the first bubble was finalized) and was
+        // creating a second identical message.
+      },
+      onServerMessage: (data) => {
+        // Primary chat text from voice_bridge.
+        if (data?.type === "bot_chat_text") {
+          ingestBotText(data?.text ?? "", "server");
+        }
       },
       onBotLlmStopped: () => {
-        finalizeAssistantTurn();
+        finalizeAssistantTurn({ removeIfEmpty: true });
         llmStreaming = false;
       },
       onUserTranscript: (data) => {
@@ -926,6 +1029,8 @@ function buildClient() {
           at_ms: Date.now(),
           bot_text: lastAssistantEl?.textContent || assistantEl?.textContent || "",
         });
+        // Close out any bubble still waiting for late LLM/TTS text.
+        if (assistantEl) finalizeAssistantTurn({ removeIfEmpty: true });
         setOrbState("listening");
         setVoiceStatus("Listening…");
       },
@@ -1122,3 +1227,6 @@ setBotAudioMuted(true);
 updateAvgResponse();
 loadUiConfig();
 refreshMicList().catch((err) => console.warn("Initial mic list failed", err));
+newPatientBtn?.addEventListener("click", () => {
+  startNewPatientSession().catch((err) => console.warn("new patient failed", err));
+});

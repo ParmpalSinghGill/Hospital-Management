@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="style.css?v=43" />
+  <link rel="stylesheet" href="style.css?v=44" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -25,7 +25,10 @@
         </div>
       </div>
 
-      <div class="topbar-right">
+        <div class="topbar-right">
+        <button id="new-patient-btn" class="new-patient-btn" type="button" title="Clear this chat and start as a new patient">
+          New patient
+        </button>
         <div id="backend-chip" class="backend-chip" title="Set providers in Admin">
           <span class="field-label">Backend</span>
           <span id="backend-label">Loading…</span>
@@ -47,7 +50,7 @@
       <div class="welcome" id="welcome-strip">
         <p class="welcome-kicker">Front desk</p>
         <h2 class="welcome-title">Chat or call — same thread</h2>
-        <p class="welcome-copy">One window for chat and calls. Providers are chosen in Admin — not in this screen.</p>
+        <p class="welcome-copy">One window for chat and calls. Use <strong>New patient</strong> to clear memory and register someone else.</p>
       </div>
       <div id="messages" class="messages"></div>
       <div id="avg-response-panel" class="avg-panel" aria-live="polite" hidden>
@@ -117,6 +120,6 @@
   </div>
 
   <audio id="bot-audio" autoplay></audio>
-  <script type="module" src="app.js?v=51"></script>
+  <script type="module" src="app.js?v=54"></script>
 </body>
 </html>

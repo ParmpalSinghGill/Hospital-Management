@@ -1,6 +1,14 @@
 """Per-session conversation JSON logs in the product schema.
 
-Saved under ``chats/`` as::
+Layout under ``chats/``::
+
+    chats/
+      sessions/          # one JSON file per call/session
+        sess-YYYYMMDD-HHMMSS_<session_id>.json
+      tool_call.json     # all tool invocations (time, args, result)
+      timeline.jsonl     # optional cross-session interrupt timeline
+
+Session file shape::
 
     {
       "session_id": "...",
@@ -24,9 +32,13 @@ from typing import Any
 
 _ROOT = Path(__file__).resolve().parent
 CHATS_DIR = Path(os.environ.get("CHAT_LOGS_DIR", _ROOT / "chats"))
+SESSIONS_DIR = CHATS_DIR / "sessions"
+TOOL_CALL_PATH = CHATS_DIR / "tool_call.json"
+TIMELINE_PATH = CHATS_DIR / "timeline.jsonl"
 _LOCK = threading.RLock()
 _OPEN: dict[str, Path] = {}
 _CURRENT_CALL_ID = threading.local()
+_MIGRATED = False
 
 
 def set_current_call_id(call_id: str | None) -> None:
@@ -70,19 +82,177 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(parts))
 
 
-def _path_for(session_id: str) -> Path:
+def _empty_tool_call_store() -> dict[str, Any]:
+    return {
+        "updated_at": None,
+        "tool_calls": [],
+    }
+
+
+def _load_tool_call_file() -> dict[str, Any]:
+    """Read ``tool_call.json`` without running layout migration (no recursion)."""
+    if not TOOL_CALL_PATH.exists():
+        return _empty_tool_call_store()
+    try:
+        data = json.loads(TOOL_CALL_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return _empty_tool_call_store()
+    if isinstance(data, list):
+        return {"updated_at": _utc_iso(), "tool_calls": data}
+    if not isinstance(data, dict):
+        return _empty_tool_call_store()
+    if not isinstance(data.get("tool_calls"), list):
+        data["tool_calls"] = []
+    return data
+
+
+def _save_tool_call_file(data: dict[str, Any]) -> None:
+    """Write ``tool_call.json`` without running layout migration."""
+    calls = data.get("tool_calls")
+    if not isinstance(calls, list):
+        calls = []
+        data["tool_calls"] = calls
+    if len(calls) > 5000:
+        data["tool_calls"] = calls[-5000:]
+    data["updated_at"] = _utc_iso()
+    data["count"] = len(data["tool_calls"])
+    TOOL_CALL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TOOL_CALL_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(TOOL_CALL_PATH)
+
+
+def _ensure_layout() -> None:
+    """Create chats/sessions/ and migrate legacy flat files once per process."""
+    global _MIGRATED
     CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    if _MIGRATED:
+        return
+    with _LOCK:
+        if _MIGRATED:
+            return
+        try:
+            # Move legacy session JSONs from chats/ root → chats/sessions/
+            for path in list(CHATS_DIR.glob("sess-*.json")) + list(CHATS_DIR.glob("call-*.json")):
+                dest = SESSIONS_DIR / path.name
+                if dest.exists():
+                    continue
+                try:
+                    path.replace(dest)
+                except OSError:
+                    pass
+
+            # Merge legacy tool_calls.jsonl → tool_call.json
+            legacy_jsonl = CHATS_DIR / "tool_calls.jsonl"
+            if legacy_jsonl.is_file():
+                existing = _load_tool_call_file()
+                seen = {
+                    json.dumps(row, sort_keys=True, default=str)
+                    for row in existing.get("tool_calls") or []
+                    if isinstance(row, dict)
+                }
+                added = 0
+                try:
+                    for line in legacy_jsonl.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        key = json.dumps(row, sort_keys=True, default=str)
+                        if key in seen:
+                            continue
+                        existing.setdefault("tool_calls", []).append(row)
+                        seen.add(key)
+                        added += 1
+                except OSError:
+                    pass
+                if added or not TOOL_CALL_PATH.exists():
+                    _save_tool_call_file(existing)
+                try:
+                    legacy_jsonl.rename(CHATS_DIR / "tool_calls.jsonl.bak")
+                except OSError:
+                    pass
+            elif not TOOL_CALL_PATH.exists():
+                _save_tool_call_file(_empty_tool_call_store())
+
+            # One-time: lift any per-session ``tool_calls`` into the shared store.
+            lift_marker = CHATS_DIR / ".tool_calls_lifted"
+            if not lift_marker.exists():
+                store = _load_tool_call_file()
+                seen = {
+                    json.dumps(row, sort_keys=True, default=str)
+                    for row in store.get("tool_calls") or []
+                    if isinstance(row, dict)
+                }
+                lifted = 0
+                for path in list(SESSIONS_DIR.glob("sess-*.json")) + list(
+                    SESSIONS_DIR.glob("call-*.json")
+                ):
+                    data = _read(path)
+                    calls = data.get("tool_calls")
+                    if not isinstance(calls, list) or not calls:
+                        continue
+                    sid = str(data.get("session_id") or data.get("call_id") or "").strip()
+                    for row in calls:
+                        if not isinstance(row, dict):
+                            continue
+                        entry = dict(row)
+                        if sid and "session_id" not in entry:
+                            entry["session_id"] = sid
+                        key = json.dumps(entry, sort_keys=True, default=str)
+                        if key in seen:
+                            continue
+                        store.setdefault("tool_calls", []).append(entry)
+                        seen.add(key)
+                        lifted += 1
+                    data.pop("tool_calls", None)
+                    data["updated_at"] = _utc_iso()
+                    _write(path, data)
+                if lifted:
+                    _save_tool_call_file(store)
+                try:
+                    lift_marker.write_text("1\n", encoding="utf-8")
+                except OSError:
+                    pass
+        finally:
+            _MIGRATED = True
+
+
+def _path_for(session_id: str) -> Path:
+    _ensure_layout()
     if session_id in _OPEN:
         return _OPEN[session_id]
     sid = _safe_id(session_id)
-    matches = sorted(CHATS_DIR.glob(f"*_{sid}.json")) + sorted(
-        CHATS_DIR.glob(f"sess_*_{sid}.json")
+    matches = sorted(SESSIONS_DIR.glob(f"*_{sid}.json")) + sorted(
+        SESSIONS_DIR.glob(f"sess_*_{sid}.json")
     )
+    # Also resolve legacy paths still under chats/ root during migration races.
+    if not matches:
+        matches = sorted(CHATS_DIR.glob(f"*_{sid}.json")) + sorted(
+            CHATS_DIR.glob(f"sess_*_{sid}.json")
+        )
     if matches:
         path = matches[-1]
+        # Prefer sessions/ location going forward.
+        if path.parent != SESSIONS_DIR:
+            new_path = SESSIONS_DIR / path.name
+            if not new_path.exists():
+                try:
+                    path.replace(new_path)
+                    path = new_path
+                except OSError:
+                    pass
+            else:
+                path = new_path
     else:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        path = CHATS_DIR / f"sess-{stamp}_{sid}.json"
+        path = SESSIONS_DIR / f"sess-{stamp}_{sid}.json"
     _OPEN[session_id] = path
     return path
 
@@ -103,6 +273,29 @@ def _write(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _read_tool_call_store() -> dict[str, Any]:
+    _ensure_layout()
+    return _load_tool_call_file()
+
+
+def _write_tool_call_store(data: dict[str, Any]) -> None:
+    _ensure_layout()
+    _save_tool_call_file(data)
+
+
+def list_tool_calls(*, limit: int = 50, source: str = "") -> list[dict[str, Any]]:
+    """Return recent tool calls from ``chats/tool_call.json`` (newest last)."""
+    with _LOCK:
+        store = _read_tool_call_store()
+        rows = [r for r in (store.get("tool_calls") or []) if isinstance(r, dict)]
+        src = (source or "").strip().lower()
+        if src:
+            rows = [r for r in rows if str(r.get("source") or "").lower() == src]
+        limit = max(1, min(int(limit or 50), 500))
+        return rows[-limit:]
+
+
+
 def _channel_label(channel: str) -> str:
     c = (channel or "web").strip().lower()
     if c in ("web", "web_app", "browser"):
@@ -111,6 +304,8 @@ def _channel_label(channel: str) -> str:
         return "cli"
     if c in ("voice", "webrtc"):
         return "web_app"
+    if c in ("telegram", "tg"):
+        return "telegram"
     return c or "web_app"
 
 
@@ -483,7 +678,7 @@ def record_server_turn(
         except ValueError:
             return v
 
-    append_or_update_turn(
+    return append_or_update_turn(
         call_id,
         {
             "input_type": input_type,
@@ -500,9 +695,6 @@ def record_server_turn(
         },
         new_turn=new_turn,
     )
-
-
-    return append_or_update_turn(call_id, patch, new_turn=new_turn)
 
 
 def record_timeline_event(
@@ -563,9 +755,9 @@ def record_timeline_event(
         _write(path, data)
 
         try:
-            CHATS_DIR.mkdir(parents=True, exist_ok=True)
+            _ensure_layout()
             line = json.dumps({"session_id": cid, **entry}, ensure_ascii=False)
-            with (CHATS_DIR / "timeline.jsonl").open("a", encoding="utf-8") as f:
+            with TIMELINE_PATH.open("a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
             pass
@@ -595,6 +787,199 @@ def record_interrupt(
         source=source,
         extra=extra,
     )
+
+
+def _truncate_tool_payload(value: Any, *, limit: int = 4000) -> Any:
+    """Keep tool args/results loggable without huge blobs."""
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) <= limit:
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            return text
+    return text[: limit - 1] + "…"
+
+
+def record_tool_call(
+    *,
+    tool: str,
+    arguments: dict[str, Any] | None = None,
+    result: Any = None,
+    source: str = "server",
+    call_id: str | None = None,
+    agent: str = "",
+    duration_ms: float | None = None,
+    ok: bool | None = None,
+    error: str = "",
+    tool_call_id: str = "",
+) -> dict[str, Any] | None:
+    """Persist one tool invocation into ``chats/tool_call.json``.
+
+    Session chat text stays in ``chats/sessions/``; all tool audits live in
+    the shared ``tool_call.json`` (linked by optional ``session_id``).
+    """
+    name = (tool or "").strip()
+    if not name:
+        return None
+
+    cid = (call_id or get_current_call_id() or "").strip()
+    args = arguments if isinstance(arguments, dict) else {}
+    entry: dict[str, Any] = {
+        "at": _utc_iso(),
+        "type": "tool_call",
+        "source": (source or "server").strip() or "server",
+        "tool": name,
+        "arguments": _truncate_tool_payload(args, limit=2000),
+    }
+    if cid:
+        entry["session_id"] = cid
+    if tool_call_id:
+        entry["tool_call_id"] = str(tool_call_id)[:120]
+    if agent:
+        entry["agent"] = str(agent).strip()
+    if duration_ms is not None:
+        try:
+            entry["duration_ms"] = round(float(duration_ms), 1)
+        except (TypeError, ValueError):
+            pass
+    if error:
+        entry["ok"] = False
+        entry["error"] = str(error)[:500]
+    else:
+        truncated = _truncate_tool_payload(result, limit=4000)
+        entry["result"] = truncated
+        if ok is None:
+            if isinstance(truncated, dict) and "ok" in truncated:
+                entry["ok"] = bool(truncated.get("ok"))
+            else:
+                entry["ok"] = True
+        else:
+            entry["ok"] = bool(ok)
+
+    with _LOCK:
+        store = _read_tool_call_store()
+        store.setdefault("tool_calls", []).append(entry)
+        _write_tool_call_store(store)
+
+    return entry
+
+
+def record_tool_calls_from_messages(
+    messages: list[Any] | None,
+    *,
+    source: str = "langgraph",
+    call_id: str | None = None,
+    agent: str = "",
+) -> int:
+    """Scan LangGraph/AI messages for tool_calls + ToolMessage results and log them."""
+    if not messages:
+        return 0
+
+    pending: dict[str, dict[str, Any]] = {}
+    logged = 0
+
+    for msg in messages:
+        role = str(getattr(msg, "type", None) or getattr(msg, "role", None) or "").lower()
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            additional = getattr(msg, "additional_kwargs", None) or {}
+            if isinstance(additional, dict):
+                tool_calls = additional.get("tool_calls")
+        if tool_calls:
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    tc_id = str(tc.get("id") or tc.get("tool_call_id") or "")
+                    name = str(tc.get("name") or tc.get("function", {}).get("name") or "")
+                    raw_args = tc.get("args")
+                    if raw_args is None and isinstance(tc.get("function"), dict):
+                        raw_args = tc["function"].get("arguments")
+                else:
+                    tc_id = str(getattr(tc, "id", "") or "")
+                    name = str(getattr(tc, "name", "") or "")
+                    raw_args = getattr(tc, "args", None)
+                args: dict[str, Any] = {}
+                if isinstance(raw_args, dict):
+                    args = raw_args
+                elif isinstance(raw_args, str) and raw_args.strip():
+                    try:
+                        parsed = json.loads(raw_args)
+                        if isinstance(parsed, dict):
+                            args = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        args = {"raw": raw_args}
+                key = tc_id or f"{name}:{logged}:{len(pending)}"
+                pending[key] = {
+                    "tool": name,
+                    "arguments": args,
+                    "tool_call_id": tc_id,
+                }
+
+        is_tool = role in ("tool", "function") or (
+            getattr(msg, "name", None) and role != "ai" and role != "assistant"
+            and getattr(msg, "content", None) is not None
+            and type(msg).__name__.lower().endswith("toolmessage")
+        )
+        if not is_tool and type(msg).__name__ == "ToolMessage":
+            is_tool = True
+        if not is_tool:
+            continue
+
+        tc_id = str(
+            getattr(msg, "tool_call_id", None)
+            or getattr(msg, "id", None)
+            or ""
+        )
+        name = str(getattr(msg, "name", None) or getattr(msg, "tool", None) or "").strip()
+        content = getattr(msg, "content", None)
+        if isinstance(content, (dict, list)):
+            result = content
+        else:
+            text = content if isinstance(content, str) else str(content or "")
+            try:
+                result = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                result = text
+
+        meta = pending.pop(tc_id, None) if tc_id else None
+        if meta is None and pending and name:
+            # Match by tool name if ids are missing.
+            for k, v in list(pending.items()):
+                if v.get("tool") == name:
+                    meta = pending.pop(k)
+                    break
+        if meta is None:
+            meta = {"tool": name or "unknown", "arguments": {}, "tool_call_id": tc_id}
+
+        record_tool_call(
+            tool=str(meta.get("tool") or name or "unknown"),
+            arguments=meta.get("arguments") if isinstance(meta.get("arguments"), dict) else {},
+            result=result,
+            source=source,
+            call_id=call_id,
+            agent=agent,
+            tool_call_id=str(meta.get("tool_call_id") or tc_id or ""),
+        )
+        logged += 1
+
+    # Tool calls that never got a ToolMessage (failed / aborted).
+    for meta in pending.values():
+        record_tool_call(
+            tool=str(meta.get("tool") or "unknown"),
+            arguments=meta.get("arguments") if isinstance(meta.get("arguments"), dict) else {},
+            result=None,
+            source=source,
+            call_id=call_id,
+            agent=agent,
+            ok=False,
+            error="no_tool_result",
+            tool_call_id=str(meta.get("tool_call_id") or ""),
+        )
+        logged += 1
+
+    return logged
 
 
 def apply_client_event(call_id: str, event: dict[str, Any]) -> dict[str, Any]:
@@ -706,9 +1091,9 @@ def apply_client_event(call_id: str, event: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_recent_calls(limit: int = 20) -> list[dict[str, Any]]:
-    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_layout()
     files = sorted(
-        list(CHATS_DIR.glob("sess-*.json")) + list(CHATS_DIR.glob("call-*.json")),
+        list(SESSIONS_DIR.glob("sess-*.json")) + list(SESSIONS_DIR.glob("call-*.json")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -733,9 +1118,9 @@ def list_recent_calls(limit: int = 20) -> list[dict[str, Any]]:
 
 
 def _iter_chat_files() -> list[Path]:
-    CHATS_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_layout()
     return sorted(
-        list(CHATS_DIR.glob("sess-*.json")) + list(CHATS_DIR.glob("call-*.json")),
+        list(SESSIONS_DIR.glob("sess-*.json")) + list(SESSIONS_DIR.glob("call-*.json")),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )

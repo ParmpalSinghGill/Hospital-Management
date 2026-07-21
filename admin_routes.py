@@ -142,6 +142,12 @@ async def patients_page():
     return _page("patients.html")
 
 
+@router.get("/patient")
+@router.get("/patient/{patient_id}")
+async def patient_page(patient_id: str | None = None):
+    return _page("patient.html")
+
+
 @router.get("/doctors")
 async def doctors_page():
     return _page("doctors.html")

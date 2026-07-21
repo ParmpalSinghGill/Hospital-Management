@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — Doctor schedule</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=14" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="top">
+      <div class="brand-row">
+        <a class="mark sm" href="/admin/" aria-label="Admin home"></a>
+        <div>
+          <h1 id="doctor-title">Doctor schedule</h1>
+          <p class="sub">Signed in as <strong id="admin-user">Admin</strong></p>
+        </div>
+      </div>
+      <nav class="nav-bar" aria-label="Admin sections">
+        <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/appointments" data-nav="appointments">Appointments</a>
+        <a href="/admin/doctors" data-nav="doctors">Doctors</a>
+        <a href="/admin/patients" data-nav="patients">Patients</a>
+      </nav>
+      <div class="top-actions">
+        <a href="/admin/doctors">All doctors</a>
+        <a href="/">Home</a>
+        <button id="logout-btn" type="button" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <p id="doctor-error" class="error" hidden></p>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 id="doctor-name">Doctor</h2>
+        <div class="panel-actions">
+          <div class="day-nav" role="group" aria-label="Schedule day">
+            <button id="day-prev" type="button" class="ghost day-arrow" aria-label="Previous day" title="Previous day">‹</button>
+            <label class="inline-day">
+              <span>Day</span>
+              <input id="schedule-day" type="date" />
+            </label>
+            <button id="day-next" type="button" class="ghost day-arrow" aria-label="Next day" title="Next day">›</button>
+          </div>
+          <button id="refresh-schedule" type="button" class="ghost">Refresh</button>
+        </div>
+      </div>
+      <p class="hint">
+        8×6 grid · 9:00 AM–5:00 PM · 10-minute slots.
+        Green = free, teal = booked, amber = unavailable (default lunch 2:00–3:00 PM), gray = passed.
+        Passed slots cannot be edited. Click a free future cell to mark unavailable; click unavailable to clear a day-specific block.
+      </p>
+      <p id="schedule-stats" class="hint"></p>
+      <div id="schedule-grid" class="schedule-grid" aria-label="Doctor day schedule"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Set unavailable range</h2>
+      </div>
+      <p class="hint">Block any window on this day (for example a half-hour break). Existing appointments in that range must be moved first.</p>
+      <form id="unavailable-form" class="filters">
+        <label>
+          <span>Start</span>
+          <input id="ua-start" type="time" value="14:00" step="600" required />
+        </label>
+        <label>
+          <span>End</span>
+          <input id="ua-end" type="time" value="14:30" step="600" required />
+        </label>
+        <label>
+          <span>Reason</span>
+          <input id="ua-reason" type="text" value="unavailable" />
+        </label>
+        <button type="submit">Block time</button>
+      </form>
+      <div id="blocks-list" class="blocks-list"></div>
+    </section>
+  </div>
+
+  <script src="/admin/static/common.js?v=8"></script>
+  <script src="/admin/static/doctor.js?v=4"></script>
+</body>
+</html>

@@ -378,15 +378,19 @@ def seed_prescriptions(
 
 
 # -------- Random seeding --------
-def _available_patients(
-    patients: List[Dict[str, Any]],
-    appts: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    booked = {
+def _booked_patient_ids(appts: List[Dict[str, Any]]) -> set[str]:
+    return {
         str(a.get("patient_id"))
         for a in appts
         if a.get("patient_id") and a.get("status") != "CANCELLED"
     }
+
+
+def _available_patients(
+    patients: List[Dict[str, Any]],
+    appts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    booked = _booked_patient_ids(appts)
     return [p for p in patients if str(p.get("patient_id")) not in booked]
 
 
@@ -394,17 +398,27 @@ def _take_free_patient(
     rng: random.Random,
     patients: List[Dict[str, Any]],
     appts: List[Dict[str, Any]],
+    *,
+    booked_ids: Optional[set[str]] = None,
+    persist: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    """Pick a patient with no active appointment; create one if the pool is empty."""
-    free = _available_patients(patients, appts)
+    """Pick a patient with no active appointment; create one if the pool is empty.
+
+    When ``persist`` is False (bulk seed), new patients stay in-memory until the
+    caller saves once — avoids rewriting the whole patients table per booking.
+    """
+    booked = booked_ids if booked_ids is not None else _booked_patient_ids(appts)
+    free = [p for p in patients if str(p.get("patient_id")) not in booked]
     if free:
         patient = rng.choice(free)
+        booked.add(str(patient.get("patient_id")))
         return patient
-    # Create a fresh patient so we never reuse someone who already has a booking
     pid = _get_next_patient_id(patients)
     patient = _random_patient(rng, pid)
     patients.append(patient)
-    _save_patients(patients)
+    booked.add(str(patient.get("patient_id")))
+    if persist:
+        _save_patients(patients)
     return patient
 
 
@@ -433,6 +447,8 @@ def seed_random_appointments_for_dates(
         patients = _load_patients()
 
     appts = _load_all_appointments()
+    booked_ids = _booked_patient_ids(appts)
+    patients_before = len(patients)
     created = 0
 
     for ds in dates:
@@ -452,10 +468,11 @@ def seed_random_appointments_for_dates(
             chosen = rng.sample(free_slots, k=k)
 
             for ts in chosen:
-                patient = _take_free_patient(rng, patients, appts)
+                patient = _take_free_patient(
+                    rng, patients, appts, booked_ids=booked_ids, persist=False
+                )
                 if patient is None:
                     continue
-                patients = _load_patients()  # refresh after possible create
                 aid = _get_next_appointment_id(appts)
                 appt = {
                     "appointment_id": aid,
@@ -469,6 +486,8 @@ def seed_random_appointments_for_dates(
                 appts.append(appt)
                 created += 1
 
+    if len(patients) != patients_before:
+        _save_patients(patients)
     _save_all_appointments(appts)
     return created
 
@@ -506,14 +525,21 @@ def seed_random_appointments_days(
     slot_minutes: int = 10,
     rng_seed: Optional[int] = None,
     fill_ratio: float = 0.5,
+    start_offset: int = 0,
 ) -> int:
     """
-    Seed random appointments for `days` days including today.
+    Seed random appointments for `days` calendar days starting at today+start_offset.
+
+    Examples:
+      days=7, start_offset=0 → today through +6
+      days=6, start_offset=1 → tomorrow through +6 (leave today alone)
+
     - For today, only slots strictly after current time are considered.
-    - Each patient gets at most ONE active appointment.
+    - Each patient gets at most ONE active appointment (new patients created as needed).
     """
     if days <= 0:
         return 0
+    start_offset = max(0, int(start_offset))
 
     _ensure_dataset_seeded()
     rng = random.Random(rng_seed)
@@ -525,12 +551,14 @@ def seed_random_appointments_days(
         patients = _load_patients()
 
     appts = _load_all_appointments()
+    booked_ids = _booked_patient_ids(appts)
+    patients_before = len(patients)
     created = 0
 
     now = datetime.now()
     today = now.date()
 
-    for i in range(days):
+    for i in range(start_offset, start_offset + days):
         d = today + timedelta(days=i)
         slots = _generate_slots_for_date(d, start_hm, end_hm, slot_minutes)
         if d == today:
@@ -553,10 +581,11 @@ def seed_random_appointments_days(
             chosen = rng.sample(free_slots, k=k)
 
             for ts in chosen:
-                patient = _take_free_patient(rng, patients, appts)
+                patient = _take_free_patient(
+                    rng, patients, appts, booked_ids=booked_ids, persist=False
+                )
                 if patient is None:
                     continue
-                patients = _load_patients()
                 aid = _get_next_appointment_id(appts)
                 appt = {
                     "appointment_id": aid,
@@ -570,6 +599,8 @@ def seed_random_appointments_days(
                 appts.append(appt)
                 created += 1
 
+    if len(patients) != patients_before:
+        _save_patients(patients)
     _save_all_appointments(appts)
     return created
 
@@ -606,7 +637,13 @@ if __name__ == "__main__":
     parser.add_argument("--prescriptions-per-patient", type=int, default=2, help="Fake Rx rows per patient.")
     parser.add_argument("--skip-prescriptions", action="store_true", help="Do not seed prescriptions.")
     parser.add_argument("--skip-chats", action="store_true", help="Do not seed booking chat transcripts.")
-    parser.add_argument("--days", type=int, default=3, help="Number of days including today to seed.")
+    parser.add_argument("--days", type=int, default=7, help="Number of days to seed (default 7).")
+    parser.add_argument(
+        "--start-offset",
+        type=int,
+        default=0,
+        help="Start seeding this many days after today (0=today, 1=tomorrow). Default 0.",
+    )
     parser.add_argument("date", nargs="*", help="Dates YYYY-MM-DD. If --range, provide START END.")
     parser.add_argument("--range", action="store_true", help="Interpret provided dates as inclusive range.")
     parser.add_argument("--per-doctor", type=int, default=0, help="Minimum slots per doctor (0 = use fill-ratio only).")
@@ -655,6 +692,12 @@ if __name__ == "__main__":
                 end_hm=args.end,
                 slot_minutes=args.slot_minutes,
                 rng_seed=args.seed,
+                start_offset=args.start_offset,
+            )
+            end_day = args.start_offset + args.days - 1
+            print(
+                f"Seeded days today+{args.start_offset} .. today+{end_day} "
+                f"({args.days} day(s))."
             )
     elif args.range:
         if len(args.date) != 2:

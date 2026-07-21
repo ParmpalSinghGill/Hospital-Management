@@ -20,13 +20,19 @@ from database import (
     _names_match,
     _find_patient_by_phone,
     _find_active_appointment_for_patient,
+    _complete_past_appointments_for_patient,
+    _normalize_phone,
+    _phone_is_complete,
     build_availability_suggestions,
+    build_department_booking_guidance,
     check_slot_bookable,
+    classify_appointment_timing,
     department_matches,
     find_nearest_available_times,
     is_within_clinic_hours,
     normalize_appointment_time,
     rank_doctors_for_preferred_time,
+    resolve_appointment_day,
 )
 
 logging.basicConfig(
@@ -99,91 +105,149 @@ def lookup_patient(
     phone: Optional[str] = None,
     patient_name: Optional[str] = None,
     patient_id: Optional[str] = None,
+    department: Optional[str] = None,
 ) -> str:
-    """Look up whether a patient already exists and return past doctors + active appointment.
+    """Look up a patient. Phone is the primary key — always ask phone first.
 
-    Prefer phone. If id is unknown, collect phone then name across turns and call again
-    to verify. Use this BEFORE booking when you have a phone number.
-    When active_appointment is present, read its time aloud if they ask when they are booked.
-
-    Args:
-        phone: Patient phone (best unique key).
-        patient_name: Full name (used with phone to verify when id unknown).
-        patient_id: Optional id like PAT-0001 if the patient remembers it.
-
-    Returns:
-        JSON with is_returning, patient, past_doctors, active_appointment (id/doctor/time),
-        and whether name still needed.
+    Names are not unique. Never identify someone from name alone or from chat memory.
+    After phone lookup: if returning, confirm the name returned in confirm_name_from_db;
+    if new, ask for their full name then save_patient.
     """
-    logging.info("lookup_patient id=%s phone=%s name=%s", patient_id, phone, patient_name)
+    logging.info(
+        "lookup_patient id=%s phone=%s name=%s department=%s",
+        patient_id,
+        phone,
+        patient_name,
+        department,
+    )
 
-    if not any([(patient_id or "").strip(), (phone or "").strip(), (patient_name or "").strip()]):
+    phone_s = (phone or "").strip()
+    name_s = (patient_name or "").strip()
+    pid_s = (patient_id or "").strip()
+
+    if not any([pid_s, phone_s, name_s]):
         return json.dumps({
             "ok": False,
-            "message": "Ask for the phone number first (patients often forget their id).",
+            "message": "Ask for the phone number first. Names can be the same for different people.",
             "needs_phone": True,
         })
 
+    # Name without phone: do not treat as identified — resolve will force needs_phone.
     resolved = _resolve_patient(
-        patient_id=(patient_id or "").strip() or None,
-        phone=(phone or "").strip() or None,
-        patient_name=(patient_name or "").strip() or None,
+        patient_id=pid_s or None,
+        phone=phone_s or None,
+        patient_name=name_s or None,
         require_name_with_phone=False,
     )
 
+    def _confirm_fields(src: dict) -> dict:
+        out = {}
+        if src.get("confirm_name_from_db"):
+            out["confirm_name_from_db"] = src.get("confirm_name_from_db")
+        if src.get("confirm_phone_from_db"):
+            out["confirm_phone_from_db"] = src.get("confirm_phone_from_db")
+        if src.get("name_match_count") is not None:
+            out["name_match_count"] = src.get("name_match_count")
+        return out
+
     if resolved.get("name_mismatch"):
-        return json.dumps({
+        payload = {
             "ok": False,
             "message": resolved.get("message"),
             "name_mismatch": True,
             "patient": resolved.get("patient"),
             "is_returning": True,
-        })
+            "needs_phone": not bool(phone_s),
+            "needs_name": True,
+        }
+        payload.update(_confirm_fields(resolved))
+        if resolved.get("patient"):
+            payload["confirm_name_from_db"] = (resolved.get("patient") or {}).get("name")
+            payload["confirm_phone_from_db"] = (resolved.get("patient") or {}).get("phone")
+        return json.dumps(payload)
 
     if resolved.get("is_new"):
         return json.dumps({
             "ok": True,
             "is_returning": False,
             "is_new": True,
-            "message": "No patient on file for this phone. Continue as a new patient.",
-            "needs_name": not bool((patient_name or "").strip()),
+            "message": (
+                "No patient on file for this phone. Ask for their full name, confirm it, "
+                "then call save_patient(patient_name=..., phone=...)."
+            ),
+            "needs_name": True,
+            "needs_phone": False,
         })
 
     if not resolved.get("ok"):
-        return json.dumps({
+        payload = {
             "ok": False,
             "message": resolved.get("message"),
             "needs_phone": resolved.get("needs_phone", False),
             "needs_name": resolved.get("needs_name", False),
-        })
+            "patient": resolved.get("patient"),
+        }
+        if resolved.get("incomplete_phone"):
+            payload["incomplete_phone"] = True
+        payload.update(_confirm_fields(resolved))
+        return json.dumps(payload)
 
     patient = resolved.get("patient")
     if not patient:
         return json.dumps({
             "ok": False,
             "message": resolved.get("message") or "Patient not found.",
+            "needs_phone": True,
         })
 
     past = _patient_past_doctors(str(patient.get("patient_id")))
     active = _find_active_appointment_for_patient(str(patient.get("patient_id")))
     active_enriched = _enrich_appointment(active) if active else None
+    timing = None
     if active_enriched:
+        timing = classify_appointment_timing(str(active_enriched.get("time") or ""))
+        active_enriched = dict(active_enriched)
+        active_enriched["timing"] = timing
+
+    confirm_name = resolved.get("confirm_name_from_db") or patient.get("name")
+    confirm_phone = resolved.get("confirm_phone_from_db") or patient.get("phone")
+    name_confirmed = bool(name_s) and _names_match(name_s, str(confirm_name or ""))
+
+    if not name_confirmed:
         msg = (
-            f"Existing patient found. Active appointment "
+            f"Phone matches patient {patient.get('patient_id')}. "
+            f"Confirm name from database: ask 'Are you {confirm_name}?' and wait for yes. "
+            f"Then call lookup_patient(phone=..., patient_name={confirm_name!r}) "
+            "before discussing appointments. "
+            "Do NOT say there is no appointment while active_appointment is present below."
+        )
+    elif active_enriched:
+        msg = (
+            f"Patient verified as {confirm_name}. Active appointment "
             f"{active_enriched.get('appointment_id')} with {active_enriched.get('doctor')} "
-            f"at {active_enriched.get('time')} (status {active_enriched.get('status')}). "
-            f"Read this time aloud if they ask when their appointment is — "
-            f"do NOT claim you lack a lookup tool."
+            f"at {active_enriched.get('time')} "
+            f"(department {active_enriched.get('department') or 'unknown'}, "
+            f"timing {timing.get('timing_bucket')})."
         )
     else:
-        msg = resolved.get("message") or "Existing patient found. No active appointment on file."
+        msg = (
+            f"Patient verified as {confirm_name} ({patient.get('patient_id')}). "
+            "No active appointment on file."
+        )
 
-    # Phone resolved → link this live/CLI call to the patient immediately.
+    guidance = None
+    dep = (department or "").strip()
+    # Guidance only after name confirm so we do not push booking before identity.
+    if dep and name_confirmed:
+        guidance = build_department_booking_guidance(active_enriched, dep)
+        if guidance.get("message"):
+            msg = f"{msg} {guidance['message']}"
+
     try:
         from conversation_log import get_current_call_id, link_call_patient
 
         call_id = get_current_call_id()
-        if call_id:
+        if call_id and name_confirmed:
             link_call_patient(
                 call_id,
                 patient_id=str(patient.get("patient_id") or ""),
@@ -193,19 +257,28 @@ def lookup_patient(
     except Exception:
         pass
 
-    return json.dumps({
+    payload = {
         "ok": True,
         "is_returning": True,
         "is_new": False,
-        "verified": resolved.get("verified", False),
-        "needs_name": resolved.get("needs_name", False),
-        "needs_phone": resolved.get("needs_phone", False),
+        "verified": name_confirmed,
+        "needs_name": not name_confirmed,
+        "needs_phone": False,
         "message": msg,
         "patient": patient,
+        # Always include appointment when found. Hiding it until name confirm made the
+        # model say "no appointments" after the user said yes but the agent re-called
+        # lookup without patient_name (active_appointment was null).
         "past_doctors": past,
-        "last_doctor": past[0] if past else None,
+        "last_doctor": (past[0] if past else None),
         "active_appointment": active_enriched,
-    })
+        "confirm_name_from_db": confirm_name,
+        "confirm_phone_from_db": confirm_phone,
+    }
+    if guidance:
+        payload["booking_guidance"] = guidance
+        payload["requested_department"] = dep
+    return json.dumps(payload)
 
 
 @tool
@@ -234,6 +307,16 @@ def save_patient(
         return json.dumps({"ok": False, "message": "patient_name is required."})
     if not ph:
         return json.dumps({"ok": False, "message": "phone is required."})
+    if not _phone_is_complete(ph):
+        return json.dumps({
+            "ok": False,
+            "message": (
+                f"Phone '{ph}' looks incomplete ({len(_normalize_phone(ph))} digits). "
+                "Ask for the full 10-digit mobile number before saving."
+            ),
+            "needs_phone": True,
+            "incomplete_phone": True,
+        })
 
     existing = _find_patient_by_phone(ph)
     if existing is not None and not _names_match(name, str(existing.get("name", ""))):
@@ -282,6 +365,8 @@ def book_appointment(
 
     Reuses an existing patient when phone matches; creates a new patient otherwise.
     Call lookup_patient first when you have a phone so returning patients can reuse a past doctor.
+    Past visits do not block a new booking (they are archived as COMPLETED automatically).
+    Only one upcoming appointment at a time — cancel or reschedule that first if it is still in the future.
     If the doctor is already booked at that time, returns ok=false with nearest_times and
     alternate_doctors — never deletes or replaces another patient's appointment.
 
@@ -339,19 +424,52 @@ def book_appointment(
         address=(address or "").strip(),
     )
 
+    # Past visits stay in the record as COMPLETED; they do not block a new booking.
+    archived = _complete_past_appointments_for_patient(patient["patient_id"])
+
     appts = _load_all_appointments()
     existing_appt = _find_active_appointment_for_patient(patient["patient_id"], appts)
     if existing_appt is not None:
-        return json.dumps({
-            "ok": False,
-            "message": (
-                f"{patient.get('name')} already has an active appointment "
+        existing_enriched = _enrich_appointment(existing_appt)
+        guidance = build_department_booking_guidance(
+            existing_enriched,
+            str(doctor_row.get("department") or ""),
+        )
+        action = guidance.get("action")
+        if action == "inform_existing_soon":
+            detail = (
+                f"{patient.get('name')} already has an appointment soon "
+                f"({existing_appt.get('appointment_id')}) with {existing_appt.get('doctor')} "
+                f"at {existing_appt.get('time')}. Tell them they already have an appointment — "
+                "do not book another."
+            )
+        elif action == "offer_prepone":
+            detail = (
+                f"{patient.get('name')} already has an appointment "
+                f"({existing_appt.get('appointment_id')}) with {existing_appt.get('doctor')} "
+                f"at {existing_appt.get('time')}. Ask if they want to prepone it, then use "
+                "reschedule_appointment — do not create a second booking."
+            )
+        elif action == "offer_new_booking":
+            detail = (
+                f"{patient.get('name')} has another upcoming visit "
+                f"({existing_appt.get('appointment_id')}) in a different department. "
+                "Confirm cancel or reschedule that one before booking this department."
+            )
+        else:
+            detail = (
+                f"{patient.get('name')} already has an upcoming appointment "
                 f"({existing_appt.get('appointment_id')}) with {existing_appt.get('doctor')} "
                 f"at {existing_appt.get('time')}. Cancel or reschedule that one first — "
-                "a patient may have only one appointment at a time."
-            ),
-            "existing_appointment": _enrich_appointment(existing_appt),
+                "a patient may have only one upcoming visit at a time."
+            )
+        return json.dumps({
+            "ok": False,
+            "message": detail,
+            "existing_appointment": existing_enriched,
+            "booking_guidance": guidance,
             "patient": patient,
+            "archived_past_visits": archived,
         })
 
     refusal = check_slot_bookable(
@@ -404,6 +522,7 @@ def book_appointment(
         "patient": patient,
         "appointment": _enrich_appointment(new_appt),
         "time_resolved_from": time,
+        "archived_past_visits": archived,
     })
 
 
@@ -643,24 +762,52 @@ def list_doctors(
 
     preferred = (preferred_time or "").strip()
     preferred_norm = normalize_appointment_time(preferred) if preferred else None
+    preferred_day = resolve_appointment_day(preferred) if preferred else None
     preferred_unavailable = False
     message = ""
+    day_only = bool(preferred and preferred_day and not preferred_norm)
 
-    if preferred:
+    if preferred and (preferred_norm or preferred_day):
         docs = rank_doctors_for_preferred_time(docs, preferred)
         free_only = [d for d in docs if d.get("free_at_preferred_time")]
         if free_only:
             docs = free_only
+            if day_only:
+                # Patient named a day but no clock — offer concrete open times.
+                enriched = []
+                sample = []
+                for d in docs[: max(1, int(limit))]:
+                    row = dict(d)
+                    nearest = row.get("nearest_times") or find_nearest_available_times(
+                        str(d.get("doctor_id") or ""),
+                        preferred,
+                        limit=3,
+                        search_days=1,
+                    )
+                    row["nearest_times"] = nearest
+                    enriched.append(row)
+                    if nearest:
+                        sample.append(f"{d.get('name')} at {nearest[0]}")
+                docs = enriched
+                message = (
+                    f"Patient asked for {preferred_day.isoformat()} without a clock time. "
+                    f"Doctors ARE available that day — offer nearest_times "
+                    + (f"(e.g. {'; '.join(sample)})" if sample else "")
+                    + " and ask which time they want. Do NOT say the doctor/day is unavailable."
+                )
         elif docs:
-            # Time blocked for all (lunch / fully booked) — stay in department,
-            # attach nearest open times so the agent can offer them.
+            # Exact clock blocked for all, OR day has no remaining slots.
             preferred_unavailable = True
             outside = preferred_norm and not is_within_clinic_hours(preferred_norm)
-            reason_bit = (
-                "outside clinic hours (9:00 AM–5:00 PM)"
-                if outside
-                else "not available (often lunch 2:00–3:00 PM, or fully booked)"
-            )
+            if day_only:
+                reason_bit = "has no remaining open slots"
+                label = preferred_day.isoformat() if preferred_day else preferred
+            elif outside:
+                reason_bit = "outside clinic hours (9:00 AM–5:00 PM)"
+                label = preferred_norm or preferred
+            else:
+                reason_bit = "not available (often lunch 2:00–3:00 PM, or fully booked)"
+                label = preferred_norm or preferred
             enriched = []
             for d in docs[: max(1, int(limit))]:
                 row = dict(d)
@@ -668,6 +815,7 @@ def list_doctors(
                     str(d.get("doctor_id") or ""),
                     preferred_norm or preferred,
                     limit=3,
+                    search_days=3 if day_only else 3,
                 )
                 row["nearest_times"] = nearest
                 enriched.append(row)
@@ -678,11 +826,17 @@ def list_doctors(
                 if nt:
                     sample.append(f"{d.get('name')} at {nt[0]}")
             message = (
-                f"Doctors are in this department, but {preferred_norm or preferred} is {reason_bit}. "
+                f"Doctors are in this department, but {label} is {reason_bit}. "
                 f"Offer nearest times in the SAME department"
                 + (f" (e.g. {'; '.join(sample)})" if sample else "")
                 + ". Do NOT switch to another department."
             )
+    elif preferred:
+        # Unparseable preferred_time — ignore for availability; do not claim unavailable.
+        message = (
+            f"Could not parse preferred_time '{preferred}' as a day/time. "
+            "Ask for a specific day and clock time (clinic 9:00 AM–5:00 PM)."
+        )
 
     docs = docs[: max(1, int(limit))]
     payload = {
@@ -690,8 +844,9 @@ def list_doctors(
         "count": len(docs),
         "doctors": docs,
         "department_filter": dep or None,
-        "preferred_time": preferred_norm or preferred or None,
+        "preferred_time": preferred_norm or (preferred_day.isoformat() if preferred_day else None) or preferred or None,
         "preferred_time_unavailable": preferred_unavailable,
+        "day_only_preference": day_only,
     }
     if message:
         payload["message"] = message

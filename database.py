@@ -22,7 +22,7 @@ BASE_DIR = os.path.dirname(__file__)
 DATASET_DIR = os.path.join(BASE_DIR, "dataset")
 DB_PATH = os.path.join(DATASET_DIR, "hospital.db")
 
-# Legacy JSON paths (used only for one-time migration)
+# Legacy JSON paths (optional one-time import if present; live store is hospital.db)
 DOCTORS_DB = os.path.join(DATASET_DIR, "doctors.json")
 PATIENTS_DB = os.path.join(DATASET_DIR, "patients.json")
 APPOINTMENTS_DB = os.path.join(DATASET_DIR, "appointments.json")
@@ -101,10 +101,10 @@ CREATE INDEX IF NOT EXISTS ix_appointments_status ON appointments(status);
 CREATE INDEX IF NOT EXISTS ix_prescriptions_patient ON prescriptions(patient_id);
 CREATE INDEX IF NOT EXISTS ix_unavailable_doctor ON doctor_unavailable(doctor_id, day);
 
--- One active booking per doctor+time (cancelled rows ignored).
+-- One active booking per doctor+time (cancelled/completed rows ignored).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_active_doctor_time
 ON appointments(doctor_id, time)
-WHERE status != 'CANCELLED' AND doctor_id != '' AND time != '';
+WHERE status NOT IN ('CANCELLED', 'COMPLETED') AND doctor_id != '' AND time != '';
 """
 
 # Clinic hours: doctors are only bookable 09:00–17:00 (not 24h).
@@ -170,7 +170,21 @@ _DEPARTMENT_ALIASES = {
     "general": "general medicine",
     "gp": "family medicine",
     "family": "family medicine",
+    "stomach": "gastroenterology",
+    "belly": "gastroenterology",
+    "abdomen": "gastroenterology",
+    "abdominal": "gastroenterology",
+    "digestive": "gastroenterology",
+    "gastric": "gastroenterology",
+    "headache": "general medicine",
+    "fever": "general medicine",
+    "cold": "general medicine",
+    "flu": "general medicine",
 }
+
+# Active appointment within this many hours → "soon" (inform only, do not rebook).
+APPOINTMENT_SOON_HOURS = 12
+
 
 
 def _department_query_terms(department: str) -> List[str]:
@@ -221,6 +235,52 @@ def _normalize_phone(phone: str) -> str:
     return "".join(ch for ch in (phone or "") if ch.isdigit())
 
 
+# Indian mobiles are 10 digits; reject shorter lookups so partial STT digits
+# (e.g. "91382292") do not create duplicate patients or miss +91 matches.
+MIN_PHONE_DIGITS = 10
+
+
+def _phone_is_complete(phone: str) -> bool:
+    return len(_normalize_phone(phone)) >= MIN_PHONE_DIGITS
+
+
+def _phone_national_digits(phone: str, *, national_len: int = 10) -> str:
+    """Return the national subscriber number (last N digits), or all digits if shorter."""
+    digits = _normalize_phone(phone)
+    if len(digits) <= national_len:
+        return digits
+    return digits[-national_len:]
+
+
+def _phone_lookup_candidates(phone: str) -> List[str]:
+    """Digit forms that should match the same handset (with/without country code)."""
+    target = _normalize_phone(phone)
+    if not target:
+        return []
+    national = _phone_national_digits(target)
+    ordered: List[str] = []
+    for form in (target, "91" + national if len(national) == 10 else "", national, "0" + national if len(national) == 10 else ""):
+        if form and form not in ordered:
+            ordered.append(form)
+    return ordered
+
+
+def _phones_match(a: str, b: str, *, min_len: int = 8) -> bool:
+    """True when two phones refer to the same number ignoring country/trunk prefix."""
+    da, db = _normalize_phone(a), _normalize_phone(b)
+    if not da or not db:
+        return False
+    if da == db:
+        return True
+    # Prefer last-10 (Indian mobile) when both are long enough
+    if len(da) >= 10 and len(db) >= 10:
+        return da[-10:] == db[-10:]
+    shorter, longer = (da, db) if len(da) <= len(db) else (db, da)
+    if len(shorter) >= min_len:
+        return longer.endswith(shorter)
+    return False
+
+
 def _parse_clock_fragment(text: str) -> Optional[Tuple[int, int]]:
     """Extract hour/minute from free text like '10 am', '10:30pm', '14:00'."""
     best: Optional[Tuple[int, int, int]] = None
@@ -250,6 +310,20 @@ def _parse_clock_fragment(text: str) -> Optional[Tuple[int, int]]:
     return best[1], best[2]
 
 
+def _parse_soft_clock_fragment(text: str) -> Optional[Tuple[int, int]]:
+    """Map vague parts of day to a clinic clock (for ranking / nearest search)."""
+    low = (text or "").lower()
+    if re.search(r"\b(noon|mid[\s-]?day)\b", low):
+        return 12, 0
+    if re.search(r"\bmorning\b", low):
+        return 10, 0
+    if re.search(r"\bafternoon\b", low):
+        return 15, 0  # after default lunch 14:00–15:00
+    if re.search(r"\bevening\b", low):
+        return 16, 0
+    return None
+
+
 def _resolve_relative_date(text: str, now: datetime):
     low = (text or "").lower()
     today = now.date()
@@ -271,12 +345,36 @@ def _resolve_relative_date(text: str, now: datetime):
     return None
 
 
+def resolve_appointment_day(
+    raw: str,
+    *,
+    now: Optional[datetime] = None,
+):
+    """Calendar day from free text even when no clock is given ('today', '2026-07-18')."""
+    s = (raw or "").strip()
+    if not s:
+        return None
+    now = now or datetime.now()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})\b", s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+        except ValueError:
+            return None
+    return _resolve_relative_date(s, now)
+
+
 def normalize_appointment_time(
     raw: str,
     *,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
-    """Convert free-text times to 'YYYY-MM-DD HH:MM' for storage and admin filters."""
+    """Convert free-text times to 'YYYY-MM-DD HH:MM' for storage and admin filters.
+
+    Day-only phrases like 'today' return None — use resolve_appointment_day /
+    find_nearest_available_times for availability. Soft clocks (morning/afternoon)
+    are accepted when a day is present.
+    """
     s = (raw or "").strip()
     if not s:
         return None
@@ -305,8 +403,8 @@ def normalize_appointment_time(
         except ValueError:
             pass
 
-    day = _resolve_relative_date(s, now)
-    clock = _parse_clock_fragment(s)
+    day = resolve_appointment_day(s, now=now)
+    clock = _parse_clock_fragment(s) or _parse_soft_clock_fragment(s)
     if day is None or clock is None:
         return None
     hour, minute = clock
@@ -325,6 +423,44 @@ def parse_appointment_datetime(raw: str, *, now: Optional[datetime] = None) -> O
         return datetime.strptime(normalized, "%Y-%m-%d %H:%M")
     except ValueError:
         return None
+
+
+def _next_clinic_slot_on_or_after(
+    day,
+    after: datetime,
+    *,
+    slot_minutes: int = _DEFAULT_SLOT_MINUTES,
+) -> Optional[datetime]:
+    """First clinic slot on ``day`` at or after ``after`` (exclusive of past)."""
+    for slot in _iter_clinic_slots_on_day(day, slot_minutes=slot_minutes):
+        if slot > after:
+            return slot
+    return None
+
+
+def parse_availability_anchor(
+    raw: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Tuple[Optional[datetime], bool]:
+    """Anchor datetime for nearest-slot search.
+
+    Returns (anchor, day_only). day_only=True when the user named a day but no clock
+    (e.g. 'today') — the exact anchor slot may still be bookable.
+    """
+    now = now or datetime.now()
+    exact = parse_appointment_datetime(raw, now=now)
+    if exact is not None:
+        return exact, False
+    day = resolve_appointment_day(raw, now=now)
+    if day is None:
+        return None, False
+    after = now if day == now.date() else datetime.combine(day, _CLINIC_START) - timedelta(minutes=1)
+    anchor = _next_clinic_slot_on_or_after(day, after)
+    if anchor is None:
+        # Day exhausted — still return clinic start so search can look ahead.
+        return datetime.combine(day, _CLINIC_START), True
+    return anchor, True
 
 
 def _extract_id_number(record_id: str, prefix: str) -> int:
@@ -366,15 +502,47 @@ def _db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+_APPOINTMENT_TERMINAL_STATUSES = frozenset({"CANCELLED", "COMPLETED"})
+
+
+def _appointment_status_is_live(status: str) -> bool:
+    """True when the row can block a new booking or counts as an active visit."""
+    return (status or "BOOKED") not in _APPOINTMENT_TERMINAL_STATUSES
+
+
+def _appointment_is_upcoming(
+    appt: Dict[str, Any],
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True for future/soon visits that still need patient action."""
+    if not _appointment_status_is_live(str(appt.get("status") or "")):
+        return False
+    timing = classify_appointment_timing(str(appt.get("time") or ""), now=now)
+    return timing.get("timing_bucket") != "past"
+
+
+def _migrate_appointment_unique_index(conn: sqlite3.Connection) -> None:
+    """Recreate partial unique index so COMPLETED visits free the slot."""
+    conn.execute("DROP INDEX IF EXISTS ux_active_doctor_time")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_active_doctor_time "
+        "ON appointments(doctor_id, time) "
+        "WHERE status NOT IN ('CANCELLED', 'COMPLETED') "
+        "AND doctor_id != '' AND time != ''"
+    )
+
+
 def init_db() -> None:
     """Create schema and migrate legacy JSON once if the DB is empty."""
     global _initialized
-    if _initialized and os.path.exists(DB_PATH):
+    if _initialized:
         return
     os.makedirs(DATASET_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     try:
         conn.executescript(_SCHEMA)
+        _migrate_appointment_unique_index(conn)
         conn.commit()
         empty = conn.execute("SELECT COUNT(*) FROM doctors").fetchone()[0] == 0
         empty = empty and conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0
@@ -557,6 +725,9 @@ def add_doctor_unavailable(
     if day_key:
         start_dt = datetime.strptime(f"{day_key} {start_padded}", "%Y-%m-%d %H:%M")
         end_dt = datetime.strptime(f"{day_key} {end_padded}", "%Y-%m-%d %H:%M")
+        now = datetime.now()
+        if end_dt <= now:
+            raise ValueError("Cannot mark unavailable in the past.")
         overlapping = []
         for a in _load_all_appointments():
             if str(a.get("doctor_id") or "").strip().upper() != did.upper():
@@ -642,6 +813,7 @@ def get_doctor_day_grid(
         booked_by_time[norm] = _enrich_appointment(a)
 
     blocks = _load_unavailable_blocks(doctor_id, day_key)
+    now = datetime.now()
     cells: List[Dict[str, Any]] = []
     for slot in slots_dt:
         key = slot.strftime("%Y-%m-%d %H:%M")
@@ -653,12 +825,15 @@ def get_doctor_day_grid(
             status = "booked"
         elif block:
             status = "unavailable"
+        past = slot < now
         cells.append({
             "time": key,
             "hm": hm,
             "hour": slot.hour,
             "minute": slot.minute,
             "status": status,
+            "past": past,
+            "editable": not past,
             "appointment": appt,
             "unavailable": block,
         })
@@ -675,15 +850,17 @@ def get_doctor_day_grid(
             row.append(by_hm.get(hm))
         grid.append(row)
 
-    free = sum(1 for c in cells if c["status"] == "free")
+    free = sum(1 for c in cells if c["status"] == "free" and not c.get("past"))
     booked = sum(1 for c in cells if c["status"] == "booked")
     unavailable = sum(1 for c in cells if c["status"] == "unavailable")
+    past_count = sum(1 for c in cells if c.get("past"))
     return {
         "doctor": doc,
         "day": day_key,
         "clinic_start": _CLINIC_START.strftime("%H:%M"),
         "clinic_end": _CLINIC_END.strftime("%H:%M"),
         "slot_minutes": slot_minutes,
+        "as_of": now.strftime("%Y-%m-%d %H:%M"),
         "hours": hours,
         "minutes": minutes,
         "cells": cells,
@@ -694,6 +871,7 @@ def get_doctor_day_grid(
             "free": free,
             "booked": booked,
             "unavailable": unavailable,
+            "past": past_count,
             "fill_pct": round(100.0 * booked / max(1, free + booked), 1),
         },
     }
@@ -813,19 +991,20 @@ def _load_patients() -> List[Dict[str, Any]]:
 def _save_patients(patients: List[Dict[str, Any]]) -> None:
     with _db() as conn:
         conn.execute("DELETE FROM patients")
-        for p in patients:
-            phone = str(p.get("phone") or "")
-            conn.execute(
-                "INSERT INTO patients(patient_id, name, phone, phone_digits, address) "
-                "VALUES (?,?,?,?,?)",
+        conn.executemany(
+            "INSERT INTO patients(patient_id, name, phone, phone_digits, address) "
+            "VALUES (?,?,?,?,?)",
+            [
                 (
                     p.get("patient_id", ""),
                     p.get("name", ""),
-                    phone,
-                    _normalize_phone(phone),
+                    str(p.get("phone") or ""),
+                    _normalize_phone(str(p.get("phone") or "")),
                     p.get("address", ""),
-                ),
-            )
+                )
+                for p in patients
+            ],
+        )
 
 
 def _get_next_patient_id(patients: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -847,30 +1026,55 @@ def _get_patient_by_id(patient_id: str) -> Optional[Dict[str, Any]]:
 
 
 def _find_patient_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """Find patient by phone, matching with or without country code (e.g. +91)."""
     target = _normalize_phone(phone)
-    if not target:
+    if len(target) < MIN_PHONE_DIGITS:
         return None
+    candidates = _phone_lookup_candidates(target)
+    national = _phone_national_digits(target)
     with _db() as conn:
-        row = conn.execute(
-            "SELECT patient_id, name, phone, address FROM patients WHERE phone_digits=?",
-            (target,),
-        ).fetchone()
-    return _patient_public(_row_to_dict(row)) if row else None
+        placeholders = ",".join("?" * len(candidates))
+        rows = conn.execute(
+            "SELECT patient_id, name, phone, address, phone_digits FROM patients "
+            f"WHERE phone_digits IN ({placeholders})",
+            tuple(candidates),
+        ).fetchall()
+        # Fallback: stored value may use another prefix but share the last 10 digits
+        if not rows and len(national) >= 10:
+            rows = conn.execute(
+                "SELECT patient_id, name, phone, address, phone_digits FROM patients "
+                "WHERE length(phone_digits) >= 10 AND substr(phone_digits, -10) = ?",
+                (national[-10:],),
+            ).fetchall()
+    if not rows:
+        return None
+    # Prefer longer stored form (+91…) over bare 10-digit duplicates, then stable id
+    best = sorted(
+        rows,
+        key=lambda r: (-len(_normalize_phone(r["phone_digits"])), r["patient_id"]),
+    )[0]
+    return _patient_public(_row_to_dict(best))
 
 
 def _find_patient_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """Return a patient only when exactly one row matches the name."""
+    matches = _find_patients_by_name(name)
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _find_patients_by_name(name: str) -> List[Dict[str, Any]]:
     target = (name or "").strip().lower()
     if not target:
-        return None
+        return []
     with _db() as conn:
         rows = conn.execute(
             "SELECT patient_id, name, phone, address FROM patients "
             "WHERE lower(trim(name))=?",
             (target,),
         ).fetchall()
-    if len(rows) == 1:
-        return _patient_public(_row_to_dict(rows[0]))
-    return None
+    return [_patient_public(_row_to_dict(r)) for r in rows]
 
 
 def _names_match(a: str, b: str) -> bool:
@@ -909,7 +1113,7 @@ def _resolve_patient(
                 "verified": False,
                 "name_mismatch": True,
             }
-        if ph and _normalize_phone(ph) != _normalize_phone(str(patient.get("phone", ""))):
+        if ph and not _phones_match(ph, str(patient.get("phone", ""))):
             return {
                 "ok": False,
                 "patient": patient,
@@ -945,6 +1149,19 @@ def _resolve_patient(
         }
 
     if ph:
+        if not _phone_is_complete(ph):
+            return {
+                "ok": False,
+                "patient": None,
+                "message": (
+                    "That phone number looks incomplete. Ask for the full 10-digit "
+                    "mobile number (with or without +91), then look up again."
+                ),
+                "verified": False,
+                "name_mismatch": False,
+                "needs_phone": True,
+                "incomplete_phone": True,
+            }
         patient = _find_patient_by_phone(ph)
         if patient is None:
             return {
@@ -973,37 +1190,66 @@ def _resolve_patient(
         return {
             "ok": True,
             "patient": patient,
-            "message": "Existing patient found by phone.",
+            "message": (
+                f"Existing patient found by phone: {patient.get('name')} "
+                f"({patient.get('patient_id')}). "
+                "Confirm this name aloud and get a yes before continuing."
+            ),
             "verified": verified,
             "name_mismatch": False,
             "is_returning": True,
             "is_new": False,
             "needs_name": not bool(name),
+            "confirm_name_from_db": patient.get("name"),
+            "confirm_phone_from_db": patient.get("phone"),
         }
 
     if name and not require_name_with_phone:
-        patient = _find_patient_by_name(name)
-        if patient is None:
+        # Names are not unique — never treat name alone as identity.
+        matches = _find_patients_by_name(name)
+        if not matches:
             return {
                 "ok": False,
-                "message": "No patient found with that exact name. Ask for phone number.",
+                "message": (
+                    "No patient found with that exact name. "
+                    "Ask for the phone number first (names can be shared)."
+                ),
                 "verified": False,
                 "name_mismatch": False,
                 "needs_phone": True,
             }
+        if len(matches) == 1:
+            only = matches[0]
+            return {
+                "ok": False,
+                "patient": only,
+                "message": (
+                    f"A patient named {only.get('name')} is on file with phone "
+                    f"{only.get('phone')}. Names can be shared — ask them to confirm "
+                    f"that phone number (or give their phone), then look up by phone."
+                ),
+                "verified": False,
+                "name_mismatch": False,
+                "is_returning": True,
+                "needs_phone": True,
+                "confirm_phone_from_db": only.get("phone"),
+                "confirm_name_from_db": only.get("name"),
+            }
         return {
-            "ok": True,
-            "patient": patient,
-            "message": "Patient found by name; confirm with phone if possible.",
+            "ok": False,
+            "message": (
+                f"Several patients share the name '{name}'. "
+                "Ask for the phone number — do not guess which person it is."
+            ),
             "verified": False,
             "name_mismatch": False,
-            "is_returning": True,
             "needs_phone": True,
+            "name_match_count": len(matches),
         }
 
     return {
         "ok": False,
-        "message": "Provide patient_id, or phone (and name when verifying without id).",
+        "message": "Ask for the phone number first (required). Names alone are not unique.",
         "verified": False,
         "name_mismatch": False,
         "needs_phone": True,
@@ -1136,11 +1382,11 @@ def _save_all_appointments(appts: List[Dict[str, Any]]) -> None:
     with _appointment_write_lock:
         with _db() as conn:
             conn.execute("DELETE FROM appointments")
-            for a in appts:
-                conn.execute(
-                    "INSERT INTO appointments("
-                    "appointment_id, patient_id, doctor_id, doctor, department, time, status"
-                    ") VALUES (?,?,?,?,?,?,?)",
+            conn.executemany(
+                "INSERT INTO appointments("
+                "appointment_id, patient_id, doctor_id, doctor, department, time, status"
+                ") VALUES (?,?,?,?,?,?,?)",
+                [
                     (
                         a.get("appointment_id", ""),
                         a.get("patient_id", ""),
@@ -1149,8 +1395,10 @@ def _save_all_appointments(appts: List[Dict[str, Any]]) -> None:
                         a.get("department", ""),
                         a.get("time", ""),
                         a.get("status", "BOOKED"),
-                    ),
-                )
+                    )
+                    for a in appts
+                ],
+            )
 
 
 def _insert_appointment(appt: Dict[str, Any]) -> None:
@@ -1232,7 +1480,7 @@ def _find_conflict(
     rows = appts if appts is not None else _load_all_appointments()
 
     for a in rows:
-        if a.get("status") == "CANCELLED":
+        if not _appointment_status_is_live(str(a.get("status") or "")):
             continue
         if exclude and str(a.get("appointment_id", "")).upper() == exclude:
             continue
@@ -1273,7 +1521,7 @@ def _active_booked_times_for_doctor(
     if not doc_id:
         return taken
     for a in _load_all_appointments():
-        if a.get("status") == "CANCELLED":
+        if not _appointment_status_is_live(str(a.get("status") or "")):
             continue
         if exclude and str(a.get("appointment_id", "")).upper() == exclude:
             continue
@@ -1307,8 +1555,12 @@ def find_nearest_available_times(
     search_days: int = 3,
     now: Optional[datetime] = None,
 ) -> List[str]:
-    """Nearest free slots for this doctor around the requested time (same clinic hours)."""
-    preferred = parse_appointment_datetime(preferred_time, now=now)
+    """Nearest free slots for this doctor around the requested time (same clinic hours).
+
+    Accepts day-only phrases like 'today' / 'tomorrow' (searches remaining slots that day first).
+    """
+    now = now or datetime.now()
+    preferred, day_only = parse_availability_anchor(preferred_time, now=now)
     if preferred is None:
         return []
     doc_id = (doctor_id or "").strip().upper()
@@ -1318,7 +1570,7 @@ def find_nearest_available_times(
     taken = _active_booked_times_for_doctor(
         doc_id, exclude_appointment_id=exclude_appointment_id
     )
-    now = now or datetime.now()
+    preferred_key = preferred.strftime("%Y-%m-%d %H:%M")
     candidates: List[Tuple[timedelta, datetime]] = []
     for day_offset in range(0, max(1, int(search_days))):
         day = preferred.date() + timedelta(days=day_offset)
@@ -1326,7 +1578,10 @@ def find_nearest_available_times(
             if slot <= now:
                 continue
             key = slot.strftime("%Y-%m-%d %H:%M")
-            if key in taken or key == preferred.strftime("%Y-%m-%d %H:%M"):
+            if key in taken:
+                continue
+            # Exact clock requests skip the conflicted preferred slot; day-only includes it.
+            if not day_only and key == preferred_key:
                 continue
             if is_doctor_unavailable(doc_id, key):
                 continue
@@ -1408,7 +1663,7 @@ def _appointment_counts_for_day(day_prefix: str) -> Dict[str, int]:
     if len(day) < 10:
         return counts
     for a in _load_all_appointments():
-        if a.get("status") == "CANCELLED":
+        if not _appointment_status_is_live(str(a.get("status") or "")):
             continue
         did = str(a.get("doctor_id") or "").strip().upper()
         if not did:
@@ -1424,26 +1679,49 @@ def rank_doctors_for_preferred_time(
     doctors: List[Dict[str, Any]],
     preferred_time: str,
 ) -> List[Dict[str, Any]]:
-    """Rank doctors: free at preferred time first, then fewer appointments that day."""
+    """Rank doctors: free at preferred time first, then fewer appointments that day.
+
+    Day-only preferences ('today') rank by who still has open slots that day and
+    attach nearest_times — they are not treated as fully unavailable.
+    """
     req = normalize_appointment_time(preferred_time)
-    if not req:
+    day = resolve_appointment_day(preferred_time)
+    if not req and not day:
         return list(doctors)
-    day_prefix = req[:10]
+
+    day_prefix = (req[:10] if req else day.isoformat())
     day_loads = _appointment_counts_for_day(day_prefix)
+    day_only = req is None
     ranked: List[Dict[str, Any]] = []
     for d in doctors:
         did = str(d.get("doctor_id") or "").strip().upper()
-        conflict = _find_conflict(
-            None,
-            str(d.get("name") or ""),
-            req,
-            doctor_id=did,
-        )
-        free_now = conflict is None and not is_doctor_unavailable(did, req) and is_within_clinic_hours(req)
         row = dict(d)
-        row["free_at_preferred_time"] = free_now
         row["day_appointment_count"] = int(day_loads.get(did, 0))
         row["day"] = day_prefix
+        if day_only:
+            nearest = find_nearest_available_times(
+                did,
+                preferred_time,
+                limit=3,
+                search_days=1,
+            )
+            row["free_at_preferred_time"] = bool(nearest)
+            row["nearest_times"] = nearest
+            row["day_only_preference"] = True
+        else:
+            conflict = _find_conflict(
+                None,
+                str(d.get("name") or ""),
+                req,
+                doctor_id=did,
+            )
+            free_now = (
+                conflict is None
+                and not is_doctor_unavailable(did, req)
+                and is_within_clinic_hours(req)
+            )
+            row["free_at_preferred_time"] = free_now
+            row["day_only_preference"] = False
         ranked.append(row)
     ranked.sort(
         key=lambda row: (
@@ -1541,24 +1819,192 @@ def _enrich_appointment(appt: Dict[str, Any]) -> Dict[str, Any]:
 def _find_active_appointment_for_patient(
     patient_id: str,
     appts: Optional[List[Dict[str, Any]]] = None,
+    *,
+    now: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Return the patient's non-cancelled appointment, if any (at most one expected)."""
+    """Return the patient's upcoming non-cancelled appointment, if any."""
     pid = (patient_id or "").strip()
     if not pid:
         return None
+
+    rows: List[Dict[str, Any]]
     if appts is not None:
-        for a in appts:
-            if a.get("patient_id") == pid and a.get("status") != "CANCELLED":
-                return a
+        rows = [a for a in appts if a.get("patient_id") == pid]
+    else:
+        with _db() as conn:
+            fetched = conn.execute(
+                "SELECT appointment_id, patient_id, doctor_id, doctor, department, time, status "
+                "FROM appointments WHERE patient_id=? "
+                "AND status NOT IN ('CANCELLED', 'COMPLETED') "
+                "ORDER BY time ASC",
+                (pid,),
+            ).fetchall()
+        rows = [_row_to_dict(r) for r in fetched]
+
+    upcoming = [a for a in rows if _appointment_is_upcoming(a, now=now)]
+    if not upcoming:
         return None
-    with _db() as conn:
-        row = conn.execute(
-            "SELECT appointment_id, patient_id, doctor_id, doctor, department, time, status "
-            "FROM appointments WHERE patient_id=? AND status!='CANCELLED' "
-            "ORDER BY time DESC LIMIT 1",
-            (pid,),
-        ).fetchone()
-    return _row_to_dict(row) if row else None
+    upcoming.sort(key=lambda a: str(a.get("time") or ""))
+    return upcoming[0]
+
+
+def _complete_past_appointments_for_patient(
+    patient_id: str,
+    *,
+    now: Optional[datetime] = None,
+) -> List[str]:
+    """Mark past BOOKED rows as COMPLETED (visit history kept). Returns appointment ids."""
+    pid = (patient_id or "").strip()
+    if not pid:
+        return []
+    completed: List[str] = []
+    for appt in _load_all_appointments():
+        if appt.get("patient_id") != pid:
+            continue
+        if str(appt.get("status") or "") != "BOOKED":
+            continue
+        if classify_appointment_timing(str(appt.get("time") or ""), now=now).get("timing_bucket") != "past":
+            continue
+        appt["status"] = "COMPLETED"
+        _update_appointment(appt)
+        aid = str(appt.get("appointment_id") or "")
+        if aid:
+            completed.append(aid)
+    return completed
+
+
+def classify_appointment_timing(
+    time_str: str,
+    *,
+    now: Optional[datetime] = None,
+    soon_hours: float = APPOINTMENT_SOON_HOURS,
+) -> Dict[str, Any]:
+    """Classify how soon an appointment is relative to now."""
+    now = now or datetime.now()
+    dt = parse_appointment_datetime(str(time_str or ""), now=now)
+    if dt is None:
+        return {
+            "timing_bucket": "unknown",
+            "hours_until": None,
+            "appointment_time": time_str,
+        }
+    delta_sec = (dt - now).total_seconds()
+    hours = delta_sec / 3600.0
+    if hours < 0:
+        bucket = "past"
+    elif hours <= float(soon_hours):
+        bucket = "soon"
+    else:
+        bucket = "later"
+    return {
+        "timing_bucket": bucket,
+        "hours_until": round(hours, 2),
+        "appointment_time": dt.strftime("%Y-%m-%d %H:%M"),
+        "soon_hours_threshold": float(soon_hours),
+    }
+
+
+def build_department_booking_guidance(
+    active_appointment: Optional[Dict[str, Any]],
+    requested_department: str,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Decide what to tell the patient after identity + department are known.
+
+    Actions:
+      - inform_existing_soon: same dept, within a few hours — do not rebook
+      - offer_prepone: same dept, days later — ask to move earlier
+      - offer_new_booking: no same-dept appointment — ask to book that department
+      - none: no requested department yet
+    """
+    req_dep = (requested_department or "").strip()
+    if not req_dep:
+        return {
+            "action": "none",
+            "same_department": None,
+            "message": "Ask symptoms or department next.",
+        }
+
+    if not active_appointment:
+        return {
+            "action": "offer_new_booking",
+            "same_department": False,
+            "requested_department": req_dep,
+            "message": (
+                f"No active appointment for {req_dep}. "
+                f"Ask: would you like to book a {req_dep} appointment?"
+            ),
+        }
+
+    appt_dep = str(active_appointment.get("department") or "")
+    same = department_matches(req_dep, appt_dep) or department_matches(appt_dep, req_dep)
+    timing = classify_appointment_timing(str(active_appointment.get("time") or ""), now=now)
+    bucket = timing.get("timing_bucket")
+    aid = active_appointment.get("appointment_id")
+    doctor = active_appointment.get("doctor")
+    when = timing.get("appointment_time") or active_appointment.get("time")
+
+    if same and bucket == "soon":
+        return {
+            "action": "inform_existing_soon",
+            "same_department": True,
+            "requested_department": req_dep,
+            "timing": timing,
+            "message": (
+                f"Patient already has {req_dep} appointment {aid} with {doctor} at {when} "
+                f"(within about {APPOINTMENT_SOON_HOURS} hours). "
+                "Tell them they already have an appointment — do NOT book another or reschedule "
+                "unless they explicitly ask to cancel or change it."
+            ),
+        }
+
+    if same and bucket in ("later", "unknown"):
+        return {
+            "action": "offer_prepone",
+            "same_department": True,
+            "requested_department": req_dep,
+            "timing": timing,
+            "message": (
+                f"Patient already has {req_dep} appointment {aid} with {doctor} at {when} "
+                "(more than a few hours away). "
+                "Ask: do you want to prepone (move earlier) this appointment? "
+                "If yes, collect a sooner day/time and call reschedule_appointment."
+            ),
+        }
+
+    if same and bucket == "past":
+        return {
+            "action": "offer_new_booking",
+            "same_department": True,
+            "requested_department": req_dep,
+            "timing": timing,
+            "message": (
+                f"Last {req_dep} visit was {aid} with {doctor} at {when} (already passed). "
+                "No need to cancel — book a new appointment directly if they want one."
+            ),
+        }
+
+    # Active appointment exists but for a different department.
+    return {
+        "action": "offer_new_booking",
+        "same_department": False,
+        "requested_department": req_dep,
+        "other_appointment": {
+            "appointment_id": aid,
+            "department": appt_dep,
+            "doctor": doctor,
+            "time": when,
+        },
+        "timing": timing,
+        "message": (
+            f"Patient has an appointment in {appt_dep or 'another department'} "
+            f"({aid} with {doctor} at {when}), not {req_dep}. "
+            f"Ask: would you like to book a {req_dep} appointment? "
+            "If yes, explain they can only keep one active visit — confirm cancel of the other "
+            "first, then book the new department."
+        ),
+    }
 
 
 def _patient_ids_with_active_appointment(
@@ -1568,7 +2014,7 @@ def _patient_ids_with_active_appointment(
     return {
         str(a.get("patient_id"))
         for a in rows
-        if a.get("patient_id") and a.get("status") != "CANCELLED"
+        if a.get("patient_id") and _appointment_is_upcoming(a)
     }
 
 

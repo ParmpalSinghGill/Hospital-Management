@@ -275,18 +275,31 @@ _RECOVERY_NUDGE = (
     "Allowed tools only (via the normal tool interface): "
     "lookup_patient, save_patient, list_doctors, book_appointment, cancel_appointment, "
     "reschedule_appointment, get_prescriptions. "
+    "SOFT HUMAN FLOW: greet first if needed; ask what brings them in — never a menu "
+    "(book/cancel/reschedule). When intent is clear, ask phone, confirm, then name, "
+    "then help from intent + patient history. "
+    "If they already have an appointment, tell them and offer to move/cancel — "
+    "do not push a new booking. If no visit for their need, offer to set one up softly. "
+    "Medicine / timing confusion → get_prescriptions after phone+name. "
     "If the patient already has an appointment and wants a new time, call reschedule_appointment. "
     "If they asked to cancel, call cancel_appointment (id or phone). "
     "After phone and name are both confirmed for a new patient, call save_patient. "
     "Always confirm the full name aloud and get a yes before save_patient or booking. "
     "If you need a tool, call it properly and then speak the result to the user. "
-    "Otherwise speak one short plain sentence: ask the next missing field, "
-    "confirm name/phone/doctor/time, or say the booking/cancel/reschedule result. "
+    "Otherwise speak one short plain sentence. "
+    "Prefer bare questions like 'What brings you in today?' or 'What's your phone number?' "
+    "— never long 'let me look you up' narration. "
     "Never invent availability lists or human handoffs. "
     "If book_appointment or reschedule_appointment returns time_conflict, "
     "offer nearest_times then alternate_doctors from that tool result only. "
     "If list_doctors returns preferred_time_unavailable, offer nearest_times "
-    "in the same department — do not switch departments for lunch/busy slots."
+    "in the same department — do not switch departments for lunch/busy slots. "
+    "If day_only_preference=true (patient said 'today' without a clock), doctors ARE "
+    "available — offer nearest_times and ask which time; never say the day is unavailable. "
+    "After department is known, call lookup_patient(phone=..., department=...) and follow "
+    "booking_guidance: inform_existing_soon, offer_prepone, or offer_new_booking. "
+    "If the user just said yes/yeah/ok/sure/go ahead to your last confirmation question, "
+    "do NOT repeat that question — call the next tool or ask the next field only."
 )
 
 _HANDOFF_RECOVERY_NUDGE = (
@@ -369,6 +382,41 @@ def _link_patient_from_graph_result(call_id: str, result: Any) -> None:
             return
 
 
+def _messages_after_last_user(messages: list[Any] | None) -> list[Any]:
+    """Return only messages after the most recent user turn."""
+    if not messages:
+        return []
+    start = 0
+    for i, msg in enumerate(messages):
+        role = str(getattr(msg, "type", None) or getattr(msg, "role", None) or "").lower()
+        if isinstance(msg, tuple) and msg:
+            role = str(msg[0] or "").lower()
+        if role in ("human", "user"):
+            start = i + 1
+    return list(messages[start:]) if start < len(messages) else list(messages)
+
+
+def _log_turn_tool_calls(
+    result: Any,
+    *,
+    call_id: str,
+    agent: str = "",
+    source: str = "langgraph",
+) -> None:
+    try:
+        from conversation_log import record_tool_calls_from_messages
+
+        msgs = _messages_after_last_user((result or {}).get("messages") or [])
+        record_tool_calls_from_messages(
+            msgs,
+            source=source,
+            call_id=call_id,
+            agent=agent or str((result or {}).get("last_agent") or ""),
+        )
+    except Exception:
+        pass
+
+
 def run_turn(
     app: Any,
     user_input: str,
@@ -403,6 +451,7 @@ def run_turn(
             agent = str(values.get("last_agent") or "")
         except Exception:
             pass
+    _log_turn_tool_calls(result, call_id=log_id, agent=agent)
 
     # DeepSeek often finishes with DSML text instead of executing tools — nudge and retry.
     attempts = 0
@@ -432,6 +481,7 @@ def run_turn(
                 agent = str(values.get("last_agent") or "")
             except Exception:
                 pass
+        _log_turn_tool_calls(result, call_id=log_id, agent=agent)
         if (
             text
             and not is_incomplete_tool_reply(text)
