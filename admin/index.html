@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/admin/static/style.css?v=12" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=19" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -44,6 +44,7 @@
       </div>
       <nav class="nav-bar" aria-label="Admin sections">
         <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/messages" data-nav="messages">Messages</a>
         <a href="/admin/appointments" data-nav="appointments">Appointments</a>
         <a href="/admin/doctors" data-nav="doctors">Doctors</a>
         <a href="/admin/patients" data-nav="patients">Patients</a>
@@ -54,14 +55,14 @@
       </div>
     </header>
 
-    <main class="grid">
+    <main class="admin-stack">
       <article class="panel">
         <div class="panel-head">
           <h2>API credits &amp; status</h2>
           <button id="refresh-credits" type="button" class="ghost">Refresh</button>
         </div>
         <p class="hint">Live balance when the provider exposes it (Deepgram needs an Owner/Admin key or <code>DEEPGRAM_MANAGE_API_KEY</code>; GLM uses Zhipu quota).</p>
-        <div id="credits" class="credits"></div>
+        <div id="credits" class="credits credits-row"></div>
       </article>
 
       <article class="panel">
@@ -71,64 +72,159 @@
         </div>
         <p class="hint">Choose which provider handles each part of the appointment system. Keys stay in <code>.env</code>.</p>
         <form id="settings-form" class="settings">
-          <label>
-            <span>Speech-to-text (Cascade)</span>
-            <select id="stt" name="stt"></select>
-          </label>
-          <label>
-            <span>Text-to-speech (Cascade)</span>
-            <select id="tts" name="tts"></select>
-          </label>
-          <label>
-            <span>Cascade LLM</span>
-            <select id="cascade_llm" name="cascade_llm"></select>
-          </label>
-          <label>
-            <span>CLI / text chat LLM</span>
-            <select id="cli_llm" name="cli_llm"></select>
-          </label>
-          <label>
-            <span>Chat window backend (Cascade or Realtime)</span>
-            <select id="voice_pipeline_default" name="voice_pipeline_default"></select>
-          </label>
-          <label>
-            <span>Deepgram voice</span>
-            <input id="deepgram_voice" name="deepgram_voice" />
-          </label>
-          <label>
-            <span>GLM model</span>
-            <input id="glm_model" name="glm_model" />
-          </label>
-          <label>
-            <span>Groq model</span>
-            <input id="groq_model" name="groq_model" />
-          </label>
-          <label>
-            <span>DeepSeek model</span>
-            <input id="deepseek_model" name="deepseek_model" />
-          </label>
-          <label>
-            <span>OpenAI Realtime model</span>
-            <input id="openai_realtime_model" name="openai_realtime_model" />
-          </label>
-          <label>
-            <span>OpenAI Realtime voice</span>
-            <select id="openai_realtime_voice" name="openai_realtime_voice"></select>
-          </label>
-          <label class="toggle-row">
-            <span>Debugging mode</span>
-            <input id="debug_mode" name="debug_mode" type="checkbox" />
-          </label>
-          <p class="hint tight">When on, the chat UI shows send time, first text token time, and first spoken word time.</p>
+          <section class="settings-block">
+            <header class="settings-block-head">
+              <h3>Cost controls</h3>
+              <p>Turn off costly providers so nobody can select or run them by mistake. At least one LLM must stay on.</p>
+            </header>
+            <div id="enabled-providers" class="enable-grid enable-grid-row" role="group" aria-label="Enabled providers">
+              <label class="toggle-row">
+                <span>DeepSeek</span>
+                <input type="checkbox" data-provider="deepseek" />
+              </label>
+              <label class="toggle-row">
+                <span>Zhipu GLM</span>
+                <input type="checkbox" data-provider="glm" />
+              </label>
+              <label class="toggle-row">
+                <span>Groq</span>
+                <input type="checkbox" data-provider="groq" />
+              </label>
+              <label class="toggle-row">
+                <span>OpenAI Chat <em class="costly">costly</em></span>
+                <input type="checkbox" data-provider="openai" />
+              </label>
+              <label class="toggle-row">
+                <span>OpenAI Realtime <em class="costly">costly</em></span>
+                <input type="checkbox" data-provider="realtime" />
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-block">
+            <header class="settings-block-head">
+              <h3>Pipeline</h3>
+              <p>Default STT / TTS / LLM path for voice and text chat.</p>
+            </header>
+            <div class="field-row">
+              <label>
+                <span>Speech-to-text</span>
+                <select id="stt" name="stt"></select>
+              </label>
+              <label>
+                <span>Text-to-speech</span>
+                <select id="tts" name="tts"></select>
+              </label>
+              <label>
+                <span>Cascade LLM</span>
+                <select id="cascade_llm" name="cascade_llm"></select>
+              </label>
+              <label>
+                <span>CLI / text LLM</span>
+                <select id="cli_llm" name="cli_llm"></select>
+              </label>
+              <label class="field-wide">
+                <span>Chat window backend</span>
+                <select id="voice_pipeline_default" name="voice_pipeline_default"></select>
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-block">
+            <header class="settings-block-head">
+              <h3>Models &amp; voices</h3>
+              <p>Provider model IDs and TTS / realtime voices.</p>
+            </header>
+            <div class="field-row">
+              <label>
+                <span>Deepgram voice</span>
+                <input id="deepgram_voice" name="deepgram_voice" />
+              </label>
+              <label>
+                <span>GLM model</span>
+                <input id="glm_model" name="glm_model" />
+              </label>
+              <label>
+                <span>Groq model</span>
+                <input id="groq_model" name="groq_model" />
+              </label>
+              <label>
+                <span>DeepSeek model</span>
+                <input id="deepseek_model" name="deepseek_model" />
+              </label>
+              <label>
+                <span>OpenAI Realtime model</span>
+                <input id="openai_realtime_model" name="openai_realtime_model" />
+              </label>
+              <label>
+                <span>OpenAI Realtime voice</span>
+                <select id="openai_realtime_voice" name="openai_realtime_voice"></select>
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-block">
+            <header class="settings-block-head">
+              <h3>Debug &amp; voice timing</h3>
+              <p>Admin-only diagnostics and end-of-speech wait for cascade calls.</p>
+            </header>
+            <div class="field-row field-row-mixed">
+              <label class="toggle-row toggle-card">
+                <span>
+                  Debugging mode
+                  <small>Show send / first-token / first-audio times in chat</small>
+                </span>
+                <input id="debug_mode" name="debug_mode" type="checkbox" />
+              </label>
+              <label class="toggle-row toggle-card">
+                <span>
+                  Save LLM messages
+                  <small>Dump each model call under Admin → Messages</small>
+                </span>
+                <input id="save_llm_messages" name="save_llm_messages" type="checkbox" />
+              </label>
+              <label>
+                <span>End-of-speech wait (seconds)</span>
+                <input
+                  id="vad_stop_secs"
+                  name="vad_stop_secs"
+                  type="number"
+                  min="0.1"
+                  max="3"
+                  step="0.01"
+                  value="0.2"
+                />
+                <small class="field-hint">0.1–3.0s · applies on the next call after Save</small>
+              </label>
+            </div>
+          </section>
+
+          <div class="settings-actions">
+            <button id="save-settings-bottom" type="button" class="primary">Save settings</button>
+          </div>
         </form>
         <p id="save-msg" class="save-msg" hidden></p>
       </article>
 
-      <article class="panel span-2">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Response timing</h2>
+          <button id="refresh-response-timings" type="button" class="ghost">Compute averages</button>
+        </div>
+        <p class="hint">
+          Averages from <code>chats/sessions/</code> — every turn’s first text and first speech latency across all users.
+        </p>
+        <p id="response-timings-meta" class="meta-line"></p>
+        <div id="response-timings" class="credits credits-row">
+          <p class="hint">Click <strong>Compute averages</strong> to load.</p>
+        </div>
+      </article>
+
+      <article class="panel">
         <div class="panel-head">
           <h2>Hospital records</h2>
         </div>
-        <p class="hint">Browse upcoming appointments by department/doctor, or open the patient directory.</p>
+        <p class="hint">Browse appointments, doctors, and patients.</p>
         <div class="quick-links">
           <a class="quick-card" href="/admin/appointments">
             <strong>Appointments</strong>
@@ -147,7 +243,7 @@
     </main>
   </section>
 
-  <script src="/admin/static/common.js?v=8"></script>
-  <script src="/admin/static/app.js?v=6"></script>
+  <script src="/admin/static/common.js?v=4"></script>
+  <script src="/admin/static/app.js?v=13"></script>
 </body>
 </html>

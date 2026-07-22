@@ -41,8 +41,10 @@ from database import (
 )
 from service_settings import (
     apply_settings_to_env,
+    is_provider_enabled,
     load_settings,
     options_catalog,
+    resolve_voice_pipeline,
     save_settings,
 )
 
@@ -124,6 +126,15 @@ class SettingsBody(BaseModel):
     openai_realtime_model: str | None = None
     openai_realtime_voice: str | None = None
     debug_mode: bool | None = None
+    save_llm_messages: bool | None = None
+    vad_stop_secs: float | None = None
+    enabled_providers: dict[str, bool] | None = None
+    # Flat flags (preferred) — False values must not be dropped on save.
+    enable_deepseek: bool | None = None
+    enable_glm: bool | None = None
+    enable_groq: bool | None = None
+    enable_openai: bool | None = None
+    enable_realtime: bool | None = None
 
 
 # -------- Pages --------
@@ -157,6 +168,11 @@ async def doctors_page():
 @router.get("/doctor/{doctor_id}")
 async def doctor_page(doctor_id: str | None = None):
     return _page("doctor.html")
+
+
+@router.get("/messages")
+async def messages_page():
+    return _page("messages.html")
 
 
 # -------- Auth / settings --------
@@ -197,11 +213,13 @@ async def ui_config():
     s = load_settings()
     return {
         "debug_mode": bool(s.get("debug_mode", False)),
-        "voice_pipeline_default": s.get("voice_pipeline_default") or "cascade",
+        "voice_pipeline_default": resolve_voice_pipeline(s),
         "cascade_llm": s.get("cascade_llm") or "deepseek",
         "cli_llm": s.get("cli_llm") or "groq",
         "stt": s.get("stt") or "deepgram",
         "tts": s.get("tts") or "deepgram",
+        "enabled_realtime": is_provider_enabled(s, "realtime"),
+        "enabled_providers": s.get("enabled_providers") or {},
     }
 
 
@@ -222,7 +240,12 @@ async def get_settings(admin_token: str | None = Cookie(default=None)):
 @router.put("/api/settings")
 async def put_settings(body: SettingsBody, admin_token: str | None = Cookie(default=None)):
     _require_auth(admin_token)
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    # exclude_unset keeps explicit False values (enable_openai=false, etc.).
+    updates = body.model_dump(exclude_unset=True)
+    if "enabled_providers" in updates and updates["enabled_providers"] is not None:
+        updates["enabled_providers"] = {
+            str(k): bool(v) for k, v in dict(updates["enabled_providers"]).items()
+        }
     try:
         saved = save_settings(updates)
     except ValueError as e:
@@ -442,9 +465,93 @@ async def chat_detail(session_id: str, admin_token: str | None = Cookie(default=
     return {"ok": True, "chat": detail}
 
 
+@router.get("/api/response-timings")
+async def response_timings(admin_token: str | None = Cookie(default=None)):
+    """Average first-text / first-speech latency across all chats/sessions."""
+    _require_auth(admin_token)
+    from conversation_log import summarize_response_timings
+
+    return summarize_response_timings()
+
+
 @router.delete("/api/chats/{session_id}")
 async def chat_delete(session_id: str, admin_token: str | None = Cookie(default=None)):
     _require_auth(admin_token)
     if not delete_call(session_id):
         raise HTTPException(status_code=404, detail=f"Chat not found: {session_id}")
     return {"ok": True, "deleted": session_id}
+
+
+@router.get("/api/llm-messages/sessions")
+async def llm_message_sessions(admin_token: str | None = Cookie(default=None)):
+    """List LLM dump sessions — oldest first for analysis."""
+    _require_auth(admin_token)
+    from llm_message_dump import list_llm_message_sessions
+
+    sessions = list_llm_message_sessions(oldest_first=True)
+    return {"ok": True, "count": len(sessions), "sessions": sessions}
+
+
+@router.delete("/api/llm-messages/sessions")
+@router.post("/api/llm-messages/delete-all")
+async def llm_message_sessions_delete_all(admin_token: str | None = Cookie(default=None)):
+    _require_auth(admin_token)
+    from llm_message_dump import delete_all_llm_messages
+
+    removed = delete_all_llm_messages()
+    return {"ok": True, "deleted": removed}
+
+
+@router.delete("/api/llm-messages/sessions/{session_id}")
+@router.post("/api/llm-messages/sessions/{session_id}/delete")
+async def llm_message_session_delete(
+    session_id: str, admin_token: str | None = Cookie(default=None)
+):
+    _require_auth(admin_token)
+    from llm_message_dump import delete_session_messages
+
+    # Idempotent: missing folder still counts as deleted for the UI.
+    delete_session_messages(session_id)
+    return {"ok": True, "deleted": session_id}
+
+
+@router.get("/api/llm-messages/sessions/{session_id}")
+async def llm_message_session_detail(
+    session_id: str, admin_token: str | None = Cookie(default=None)
+):
+    _require_auth(admin_token)
+    from llm_message_dump import list_session_pairs, read_session_runtime_meta
+
+    pairs = list_session_pairs(session_id)
+    if not pairs:
+        raise HTTPException(status_code=404, detail=f"No LLM messages for session: {session_id}")
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "count": len(pairs),
+        "pairs": pairs,
+        "session_meta": read_session_runtime_meta(session_id),
+    }
+
+
+@router.get("/api/llm-messages/sessions/{session_id}/pairs/{n}")
+async def llm_message_pair(
+    session_id: str, n: int, admin_token: str | None = Cookie(default=None)
+):
+    _require_auth(admin_token)
+    from llm_message_dump import list_session_pairs, read_session_pair
+
+    pair = read_session_pair(session_id, n)
+    if not pair:
+        raise HTTPException(status_code=404, detail=f"Pair not found: {session_id} #{n}")
+    pairs = list_session_pairs(session_id)
+    nums = [int(p.get("n") or 0) for p in pairs]
+    idx = nums.index(n) if n in nums else -1
+    return {
+        "ok": True,
+        "pair": pair,
+        "index": idx,
+        "total": len(pairs),
+        "prev_n": nums[idx - 1] if idx > 0 else None,
+        "next_n": nums[idx + 1] if 0 <= idx < len(nums) - 1 else None,
+    }

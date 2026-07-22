@@ -1,3 +1,6 @@
+@import url("/shared/tokens.css");
+
+/* Fallbacks when /shared is not mounted. */
 :root {
   --ink: #14302c;
   --ink-soft: #3d5c57;

@@ -106,6 +106,146 @@ def _last_user_text(context) -> str:
     return ""
 
 
+# --- Phone-fragment merge (STT text only; does not touch VAD / mute) ---
+
+_PHONE_FRAGMENT_WAIT_S = 1.15
+
+_SPOKEN_DIGIT = {
+    "zero": "0",
+    "oh": "0",
+    "o": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+}
+
+_PHONE_FILLER = frozenset(
+    {
+        "a",
+        "and",
+        "double",
+        "full",
+        "is",
+        "it",
+        "it's",
+        "its",
+        "my",
+        "number",
+        "phone",
+        "please",
+        "so",
+        "that's",
+        "thats",
+        "the",
+        "triple",
+        "uh",
+        "um",
+        "yes",
+    }
+)
+
+
+def merge_utterances(left: str, right: str) -> str:
+    """Join two utterances; drop exact duplicates / containment."""
+    a = (left or "").strip()
+    b = (right or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if b == a or b in a:
+        return a
+    if a in b:
+        return b
+    return f"{a} {b}"
+
+
+def transcript_phone_digits(text: str) -> str:
+    """Pull digit characters from STT text (spoken words + numerals)."""
+    import re
+
+    raw = str(text or "").lower()
+    tokens = re.findall(r"[a-z0-9']+", raw)
+    digits: list[str] = []
+    repeat = 1
+    for tok in tokens:
+        if tok in ("double", "triple"):
+            repeat = 2 if tok == "double" else 3
+            continue
+        if tok.isdigit():
+            digits.append(tok)
+            repeat = 1
+            continue
+        mapped = _SPOKEN_DIGIT.get(tok)
+        if mapped is not None:
+            digits.append(mapped * repeat)
+            repeat = 1
+            continue
+        repeat = 1
+    return "".join(digits)
+
+
+def bot_awaiting_phone(bot_text: str) -> bool:
+    """True when the last bot reply was asking for a phone / number."""
+    t = str(bot_text or "").lower()
+    return any(
+        key in t
+        for key in (
+            "phone",
+            "mobile",
+            "number",
+            "digit",
+            "contact",
+        )
+    )
+
+
+def looks_like_phone_fragment(text: str) -> bool:
+    """True if STT text is mostly an incomplete phone (digit words / numerals).
+
+    Complete 10+ digit numbers return False so they go to the agent immediately.
+    """
+    import re
+
+    from db_patients import _phone_is_complete
+
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    digits = transcript_phone_digits(raw)
+    if len(digits) < 2:
+        return False
+    if _phone_is_complete(digits):
+        return False
+
+    tokens = re.findall(r"[a-z0-9']+", raw.lower())
+    leftover = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("double", "triple"):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if nxt in _SPOKEN_DIGIT or (nxt.isdigit() and len(nxt) == 1):
+                i += 2
+                continue
+            leftover.append(tok)
+            i += 1
+            continue
+        if tok in _SPOKEN_DIGIT or tok.isdigit() or tok in _PHONE_FILLER:
+            i += 1
+            continue
+        leftover.append(tok)
+        i += 1
+    # Allow a couple of soft words ("it's", already filler) — reject real sentences.
+    return len(leftover) == 0
+
+
 def make_langgraph_processor(
     thread_id: str,
     graph_app: Any,
@@ -151,6 +291,79 @@ def make_langgraph_processor(
             self._last_user_text = ""
             self._last_user_at = 0.0
             self._pending_user_text = ""
+            self._phone_buffer = ""
+            self._phone_flush_task: asyncio.Task | None = None
+
+        def _cancel_phone_flush(self) -> None:
+            task = self._phone_flush_task
+            self._phone_flush_task = None
+            if task and not task.done():
+                task.cancel()
+
+        def _queue_while_busy(self, user_text: str) -> None:
+            """Append (don't overwrite) so digit fragments aren't dropped."""
+            self._pending_user_text = merge_utterances(self._pending_user_text, user_text)
+            logger.info(f"Queuing user turn while busy: {user_text!r}")
+            try:
+                from conversation_log import record_timeline_event
+
+                record_timeline_event(
+                    log_call_id,
+                    event_type="queued_while_busy",
+                    user_text=user_text,
+                    bot_text=str(state.get("last_bot_text") or ""),
+                    phase="agent_busy",
+                )
+            except Exception:
+                pass
+
+        def _start_turn(self, user_text: str, direction: FrameDirection) -> None:
+            self._busy = True
+            state["busy"] = True
+            self.create_task(
+                self._drain_turns(user_text, direction),
+                name="hospital_langgraph_turn",
+            )
+
+        async def _flush_phone_buffer(self, direction: FrameDirection) -> None:
+            """After a short pause, send buffered digit fragments as one turn."""
+            try:
+                await asyncio.sleep(_PHONE_FRAGMENT_WAIT_S)
+            except asyncio.CancelledError:
+                return
+            self._phone_flush_task = None
+            text = (self._phone_buffer or "").strip()
+            self._phone_buffer = ""
+            if not text:
+                return
+            logger.info(f"Flushing phone fragment buffer: {text!r}")
+            if self._busy:
+                self._queue_while_busy(text)
+                return
+            self._start_turn(text, direction)
+
+        def _buffer_phone_fragment(self, user_text: str, direction: FrameDirection) -> None:
+            from db_patients import _phone_is_complete
+
+            self._phone_buffer = merge_utterances(self._phone_buffer, user_text)
+            digits = transcript_phone_digits(self._phone_buffer)
+            logger.info(
+                f"Buffering phone fragment ({len(digits)} digits): {user_text!r} → {self._phone_buffer!r}"
+            )
+            if _phone_is_complete(digits):
+                self._cancel_phone_flush()
+                text = self._phone_buffer.strip()
+                self._phone_buffer = ""
+                if self._busy:
+                    self._queue_while_busy(text)
+                else:
+                    self._start_turn(text, direction)
+                return
+            self._cancel_phone_flush()
+            self._phone_flush_task = self.create_task(
+                self._flush_phone_buffer(direction),
+                name="hospital_phone_fragment_flush",
+            )
 
         async def _push_spoken_reply(self, reply: str, direction: FrameDirection):
             """Show full text in chat, synthesize as one TTS utterance.
@@ -264,31 +477,28 @@ def make_langgraph_processor(
                     logger.debug(f"Skipping duplicate LangGraph turn: {user_text!r}")
                     return
 
-                if self._busy:
-                    self._pending_user_text = user_text
-                    logger.info(f"Queuing user turn while busy: {user_text!r}")
-                    try:
-                        from conversation_log import record_timeline_event
+                awaiting = bot_awaiting_phone(str(state.get("last_bot_text") or ""))
+                if awaiting and looks_like_phone_fragment(user_text):
+                    if self._busy:
+                        self._queue_while_busy(user_text)
+                    else:
+                        self._buffer_phone_fragment(user_text, direction)
+                    return
 
-                        record_timeline_event(
-                            log_call_id,
-                            event_type="queued_while_busy",
-                            user_text=user_text,
-                            bot_text=str(state.get("last_bot_text") or ""),
-                            phase="agent_busy",
-                        )
-                    except Exception:
-                        pass
+                # Non-fragment while digits were buffering — flush together once.
+                if self._phone_buffer:
+                    self._cancel_phone_flush()
+                    user_text = merge_utterances(self._phone_buffer, user_text)
+                    self._phone_buffer = ""
+                    logger.info(f"Flushing phone buffer with follow-up: {user_text!r}")
+
+                if self._busy:
+                    self._queue_while_busy(user_text)
                     return
 
                 # Return immediately so barge-in can cancel/recreate the process
                 # task while LangGraph keeps running in the background.
-                self._busy = True
-                state["busy"] = True
-                self.create_task(
-                    self._drain_turns(user_text, direction),
-                    name="hospital_langgraph_turn",
-                )
+                self._start_turn(user_text, direction)
                 return
 
             await self.push_frame(frame, direction)

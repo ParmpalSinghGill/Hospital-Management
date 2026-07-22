@@ -1,10 +1,18 @@
 /** Shared admin helpers: API, auth guard, top nav. */
 
 async function api(path, opts = {}) {
+  const { headers: optHeaders, body, ...rest } = opts;
+  const headers = { ...(optHeaders || {}) };
+  // Only set JSON content-type when we actually send a body. Bare DELETE/POST
+  // with Content-Type: application/json and an empty body can confuse proxies.
+  if (body !== undefined && body !== null && !headers["Content-Type"] && !headers["content-type"]) {
+    headers["Content-Type"] = "application/json";
+  }
   const res = await fetch(path, {
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
-    ...opts,
+    headers,
+    body,
+    ...rest,
   });
   let data = null;
   try {

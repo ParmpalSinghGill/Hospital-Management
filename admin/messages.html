@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DBC Care — LLM Messages</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=19" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+
+  <div class="shell">
+    <header class="top">
+      <div class="brand-row">
+        <a class="mark sm" href="/admin/" aria-label="Admin home"></a>
+        <div>
+          <h1>LLM Messages</h1>
+          <p class="sub">Signed in as <strong id="admin-user">Admin</strong></p>
+        </div>
+      </div>
+      <nav class="nav-bar" aria-label="Admin sections">
+        <a href="/admin/" data-nav="settings">Settings</a>
+        <a href="/admin/messages" data-nav="messages">Messages</a>
+        <a href="/admin/appointments" data-nav="appointments">Appointments</a>
+        <a href="/admin/doctors" data-nav="doctors">Doctors</a>
+        <a href="/admin/patients" data-nav="patients">Patients</a>
+      </nav>
+      <div class="top-actions">
+        <a href="/">Home</a>
+        <button id="logout-btn" type="button" class="ghost">Log out</button>
+      </div>
+    </header>
+
+    <section class="panel" id="sessions-panel">
+      <div class="panel-head">
+        <h2>Sessions</h2>
+        <div class="panel-actions">
+          <button id="sort-sessions" type="button" class="ghost" aria-pressed="true" title="Toggle oldest / newest first">
+            Newest first
+          </button>
+          <button id="refresh-sessions" type="button" class="ghost">Refresh</button>
+          <button id="delete-all-sessions" type="button" class="ghost danger-btn">Delete all</button>
+        </div>
+      </div>
+      <p class="hint">Sessions sorted by time. Each session stores exact LLM request/response pairs (enable “Save LLM messages” in Settings).</p>
+      <p id="sessions-meta" class="meta-line"></p>
+      <div id="sessions-list" class="llm-session-list"></div>
+    </section>
+
+    <section class="panel" id="viewer-panel" hidden>
+      <div class="panel-head">
+        <h2 id="viewer-title">Message</h2>
+        <div class="viewer-actions">
+          <button id="back-sessions" type="button" class="ghost">← Sessions</button>
+          <button id="delete-session" type="button" class="ghost danger-btn">Delete session</button>
+          <button id="prev-pair" type="button" class="ghost">Previous</button>
+          <button id="next-pair" type="button" class="primary">Next</button>
+        </div>
+      </div>
+      <p id="viewer-meta" class="meta-line"></p>
+      <dl id="viewer-runtime" class="llm-runtime-meta" aria-label="Runtime VAD settings"></dl>
+      <div class="llm-pair-grid">
+        <article class="llm-pane">
+          <h3>Passed to LLM</h3>
+          <pre id="passed-body" class="llm-pre"></pre>
+        </article>
+        <article class="llm-pane">
+          <h3>LLM response</h3>
+          <pre id="response-body" class="llm-pre"></pre>
+        </article>
+      </div>
+    </section>
+  </div>
+
+  <script src="/admin/static/common.js?v=4"></script>
+  <script src="/admin/static/messages.js?v=8"></script>
+</body>
+</html>

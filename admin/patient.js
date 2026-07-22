@@ -53,9 +53,12 @@
 
       const card = document.createElement("details");
       card.className = "chat-card";
-      const kind = chat.kind || chat.pipeline_mode || "live";
+      const kind = chat.is_seed
+        ? "synthetic booking summary"
+        : chat.kind || chat.pipeline_mode || "live";
       const topic = chat.topic ? ` · ${chat.topic}` : "";
       const sessionKey = chat.session_id || chat.file;
+      if (chat.is_seed) row.classList.add("is-seed");
       const turnsHtml = (chat.turns || [])
         .map((t) => {
           const agent = (t.agent || "").trim();

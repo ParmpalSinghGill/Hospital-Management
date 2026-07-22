@@ -355,9 +355,12 @@ function recordTextLatency() {
   debugLog("first text", formatExactTime(turnTextAt), formatLatency(turnTextLatencyMs));
   renderBotDebug();
   updateAvgResponse();
+  const text = botLineBody?.textContent || lastBotLineBody?.textContent || "";
   logClientEvent("bot_text_first_shown", {
     at_ms: turnTextAt,
-    text: botLineBody?.textContent || "",
+    latency_ms: Math.round(turnTextLatencyMs),
+    text,
+    first_text: text,
   });
 }
 
@@ -370,7 +373,13 @@ function recordVoiceLatency() {
   debugLog("first audio", formatExactTime(turnVoiceAt), formatLatency(turnVoiceLatencyMs));
   renderBotDebug();
   updateAvgResponse();
-  logClientEvent("bot_voice_first_heard", { at_ms: turnVoiceAt });
+  const text = lastBotLineBody?.textContent || botLineBody?.textContent || "";
+  logClientEvent("bot_voice_first_heard", {
+    at_ms: turnVoiceAt,
+    latency_ms: Math.round(turnVoiceLatencyMs),
+    text,
+    first_speech: text,
+  });
 }
 
 function appendBotText(chunk) {
@@ -408,7 +417,8 @@ function endBotTurn() {
   botLineWrap?.classList.remove("pending");
   botLineWrap = null;
   botLineBody = null;
-  if (hadText || voiceLatencyRecorded) {
+  // Keep turn clock until first audio (lite is voice-first).
+  if (voiceLatencyRecorded) {
     resetTurnTiming();
   }
 }
@@ -564,6 +574,7 @@ function buildClient() {
           at_ms: Date.now(),
           text: lastBotLineBody?.textContent || botLineBody?.textContent || "",
         });
+        if (userTurnPending) resetTurnTiming();
       },
       onLocalAudioLevel: (level) => {
         localMicLevel = level;
@@ -581,6 +592,13 @@ function buildClient() {
         setMeter(userMeter, userMeterWrap, userSpeakState, level, label);
       },
       onRemoteAudioLevel: (level) => {
+        if (
+          userTurnPending &&
+          !voiceLatencyRecorded &&
+          Number(level) >= MIC_SOFT_THRESHOLD
+        ) {
+          recordVoiceLatency();
+        }
         if (!botSpeaking && level < MIC_SOFT_THRESHOLD) {
           setMeter(botMeter, botMeterWrap, botSpeakState, 0, "idle");
           return;
@@ -624,12 +642,21 @@ async function loadUiConfig() {
     if (!res.ok) return;
     const data = await res.json();
     debugMode = Boolean(data.debug_mode);
+    const realtimeOk = data.enabled_realtime !== false;
+    const realtimeOpt = [...modeSelect.options].find((o) => o.value === "realtime");
+    if (realtimeOpt) {
+      realtimeOpt.disabled = !realtimeOk;
+      realtimeOpt.hidden = !realtimeOk;
+    }
+    if (!realtimeOk && modeSelect.value === "realtime") {
+      modeSelect.value = "cascade";
+    }
     if (!connected && data.voice_pipeline_default) {
       modeSelect.value =
-        data.voice_pipeline_default === "realtime" ? "realtime" : "cascade";
+        data.voice_pipeline_default === "realtime" && realtimeOk ? "realtime" : "cascade";
     }
     updateAvgResponse();
-    debugLog("ui-config", { debugMode, pipeline: modeSelect.value });
+    debugLog("ui-config", { debugMode, pipeline: modeSelect.value, realtimeOk });
   } catch (err) {
     console.warn("ui-config fetch failed", err);
   }

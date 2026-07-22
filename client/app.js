@@ -3,6 +3,13 @@ import {
   SmallWebRTCTransport,
   WavMediaManager,
 } from "./vendor/small-webrtc-transport.bundle.mjs";
+import {
+  averageLatency,
+  formatExactTime,
+  formatLatency,
+  isDuplicateBotText,
+  normalizeBotBubbleText,
+} from "./lib/format.js";
 
 const banner = document.getElementById("banner");
 const statusDot = document.getElementById("status-dot");
@@ -21,8 +28,6 @@ const composerForm = document.getElementById("composer-form");
 const textInput = document.getElementById("text-input");
 const micButton = document.getElementById("mic-button");
 const micButtonLabel = document.getElementById("mic-button-label");
-const vadButton = document.getElementById("vad-button");
-const vadButtonLabel = document.getElementById("vad-button-label");
 
 const callDock = document.getElementById("call-dock");
 const voiceClose = document.getElementById("voice-close");
@@ -32,50 +37,7 @@ const voiceMicFeedback = document.getElementById("voice-mic-feedback");
 const voiceStatus = document.getElementById("voice-status");
 const voiceCaption = document.getElementById("voice-caption");
 const voiceMute = document.getElementById("voice-mute");
-const voiceVad = document.getElementById("voice-vad");
 const botAudio = document.getElementById("bot-audio");
-
-const VAD_MODE_KEY = "dbc_vad_mode";
-/** @type {"sensitive" | "stable"} */
-let vadMode = localStorage.getItem(VAD_MODE_KEY) === "stable" ? "stable" : "sensitive";
-
-function vadLabel(mode = vadMode) {
-  return mode === "stable" ? "VAD: Stable" : "VAD: Sensitive";
-}
-
-function syncVadButtons() {
-  const label = vadLabel();
-  const isStable = vadMode === "stable";
-  if (vadButtonLabel) vadButtonLabel.textContent = label;
-  if (vadButton) {
-    vadButton.classList.toggle("stable", isStable);
-    vadButton.title =
-      modeHintTitle() +
-      (voiceCallActive ? " (takes effect on next call)" : "");
-  }
-  if (voiceVad) {
-    voiceVad.textContent = label;
-    voiceVad.classList.toggle("stable", isStable);
-    voiceVad.title =
-      modeHintTitle() +
-      (voiceCallActive ? " (takes effect on next call)" : "");
-  }
-}
-
-function modeHintTitle() {
-  return vadMode === "stable"
-    ? "Stable: less sensitive voice detection (fewer echo cuts)"
-    : "Sensitive: default voice detection (faster barge-in)";
-}
-
-function toggleVadMode() {
-  vadMode = vadMode === "stable" ? "sensitive" : "stable";
-  localStorage.setItem(VAD_MODE_KEY, vadMode);
-  syncVadButtons();
-  if (voiceCallActive) {
-    showBanner("VAD set to " + (vadMode === "stable" ? "Stable" : "Sensitive") + " — end call and start again to apply.");
-  }
-}
 
 let client = null;
 let connected = false;
@@ -287,30 +249,6 @@ function scrollToBottom() {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
-function formatLatency(ms) {
-  if (ms == null || Number.isNaN(ms)) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${(ms / 1000).toFixed(2)}s`;
-}
-
-function formatExactTime(dateLike) {
-  if (!dateLike) return "—";
-  const d = dateLike instanceof Date ? dateLike : new Date(dateLike);
-  const base = d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  const ms = String(d.getMilliseconds()).padStart(3, "0");
-  return `${base}.${ms}`;
-}
-
-function averageLatency(samples) {
-  if (!samples.length) return "—";
-  const avg = samples.reduce((sum, n) => sum + n, 0) / samples.length;
-  return `${formatLatency(avg)} (${samples.length})`;
-}
-
 function updateAvgResponse() {
   avgTextEl.textContent = averageLatency(textResponseTimesMs);
   avgVoiceEl.textContent = averageLatency(voiceResponseTimesMs);
@@ -363,6 +301,10 @@ function renderAssistantDebug(metaOrWrap) {
   box.innerHTML = lines.join("") || `<span class="dbg-line">Waiting for response…</span>`;
 }
 
+function expectAudioThisTurn() {
+  return turnMode === "voice" || voiceCallActive;
+}
+
 function recordTextLatency() {
   if (!userTurnPending || textLatencyRecorded || pendingUserAt == null) return;
   turnTextAt = Date.now();
@@ -371,9 +313,12 @@ function recordTextLatency() {
   textResponseTimesMs.push(turnTextLatencyMs);
   renderAssistantDebug();
   updateAvgResponse();
+  const text = assistantEl?.textContent || lastAssistantEl?.textContent || "";
   logClientEvent("bot_text_first_shown", {
     at_ms: turnTextAt,
-    text: assistantEl?.textContent || "",
+    latency_ms: Math.round(turnTextLatencyMs),
+    text,
+    first_text: text,
   });
 }
 
@@ -385,7 +330,14 @@ function recordVoiceLatency() {
   voiceResponseTimesMs.push(turnVoiceLatencyMs);
   renderAssistantDebug();
   updateAvgResponse();
-  logClientEvent("bot_voice_first_heard", { at_ms: turnVoiceAt });
+  const text =
+    lastAssistantEl?.textContent || assistantEl?.textContent || lastShownBotText || "";
+  logClientEvent("bot_voice_first_heard", {
+    at_ms: turnVoiceAt,
+    latency_ms: Math.round(turnVoiceLatencyMs),
+    text,
+    first_speech: text,
+  });
 }
 
 function resetTurnTiming() {
@@ -506,20 +458,6 @@ function appendAssistantText(chunk) {
   scrollToBottom();
 }
 
-function normalizeBotBubbleText(text) {
-  return String(text || "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function isDuplicateBotText(incoming, existing) {
-  if (!incoming || !existing) return false;
-  if (incoming === existing) return true;
-  // TTS often re-sends the same reply in chunks after the first bubble closed.
-  if (existing.startsWith(incoming) || incoming.startsWith(existing)) return true;
-  return false;
-}
-
 function finalizeAssistantTurn({ removeIfEmpty = false } = {}) {
   const hadText = Boolean(assistantEl?.textContent?.trim());
   const finalText = assistantEl?.textContent || "";
@@ -550,7 +488,10 @@ function finalizeAssistantTurn({ removeIfEmpty = false } = {}) {
     assistantWrap = null;
     botTextSource = null;
   }
-  if (hadText || voiceLatencyRecorded) {
+  // Keep the turn clock open until first audio when TTS is expected.
+  // Resetting on LLM-stop previously wiped pendingUserAt before speaking,
+  // so Avg first audio / First audio never recorded.
+  if (voiceLatencyRecorded || (hadText && !expectAudioThisTurn())) {
     resetTurnTiming();
   }
 }
@@ -612,8 +553,10 @@ function updateMicVisual(level = localMicLevel) {
 }
 
 function setBotAudioMuted(muted) {
+  if (!botAudio) return;
   botAudio.muted = muted;
-  if (!muted && botAudio.srcObject) {
+  if (!muted) {
+    // autoplay is allowed after the Call click; retry whenever we unmute.
     botAudio.play().catch((err) => console.warn("Bot audio play failed", err));
   }
 }
@@ -621,7 +564,12 @@ function setBotAudioMuted(muted) {
 function attachBotAudioTrack(track) {
   if (!track || track.kind !== "audio") return;
   remoteAudioTrack = track;
-  botAudio.srcObject = new MediaStream([track]);
+  if (botAudio) {
+    botAudio.srcObject = new MediaStream([track]);
+  }
+  // If the call dock is already open, unmute + play immediately. Tracks often
+  // arrive after openCallDock(); a failed play() here used to leave TTS silent
+  // even though bot_started_speaking still fired.
   setBotAudioMuted(!voiceCallActive);
 }
 
@@ -660,10 +608,15 @@ async function openCallDock() {
   voiceCaption.textContent = "";
   callDock.hidden = false;
   setBotAudioMuted(false);
-  syncVadButtons();
-  // New voice leg after End call (WebRTC may still be up) → fresh call log,
-  // same thread_id for agent memory.
-  if (!callId) {
+  // Track may already be attached from ensureConnected — force play on this
+  // user gesture so later TTS is not stuck behind an autoplay block.
+  if (botAudio?.srcObject) {
+    botAudio.play().catch((err) => console.warn("Bot audio play failed", err));
+  }
+  // Re-open voice UI on an existing WebRTC session: keep the same call_id so
+  // client events stay on the server bot's session (minting a new id here was
+  // splitting logs — server kept writing to the old session).
+  if (!callId && connected) {
     try {
       await startCallLog();
     } catch (err) {
@@ -678,9 +631,9 @@ function closeCallDock() {
   callDock.hidden = true;
   micButtonLabel.textContent = "Call";
   setBotAudioMuted(true);
-  // Close this call's log, but keep thread_id + chat so the next call
-  // in this window remembers the conversation (like continuing with the same desk).
-  endCallLog();
+  // Do NOT endCallLog here — WebRTC often stays up for text chat. Ending the
+  // log and minting a new call_id on the next mic open split client vs server
+  // sessions (voice-start-only on one file, chat turns on another).
 }
 
 function micLabel(device, index) {
@@ -927,6 +880,7 @@ function buildClient() {
         connecting = false;
         setStatus("idle");
         closeCallDock();
+        endCallLog();
       },
       onError: (message) => {
         console.error("RTVI error", message);
@@ -1031,6 +985,7 @@ function buildClient() {
         });
         // Close out any bubble still waiting for late LLM/TTS text.
         if (assistantEl) finalizeAssistantTurn({ removeIfEmpty: true });
+        if (userTurnPending) resetTurnTiming();
         setOrbState("listening");
         setVoiceStatus("Listening…");
       },
@@ -1040,6 +995,15 @@ function buildClient() {
       },
       onRemoteAudioLevel: (level) => {
         if (voiceCallActive && botSpeaking) orb.style.setProperty("--level", level);
+        // Fallback when BotStartedSpeaking is missed but remote audio is audible.
+        if (
+          userTurnPending &&
+          !voiceLatencyRecorded &&
+          expectAudioThisTurn() &&
+          Number(level) >= 0.06
+        ) {
+          recordVoiceLatency();
+        }
       },
       onTrackStarted: async (track, participant) => {
         if (participant?.local && track.kind === "audio") {
@@ -1078,7 +1042,6 @@ async function ensureConnected() {
           call_id: id,
           thread_id: getOrCreateThreadId(),
           user_id: getOrCreateUserId(),
-          vad_mode: vadMode,
         },
       },
     });
@@ -1123,12 +1086,7 @@ async function disconnectAndReset() {
   connected = false;
   connecting = false;
   await endCallLog();
-  // Avoid double endCallLog from closeCallDock
-  voiceCallActive = false;
-  document.body.classList.remove("in-call");
-  if (callDock) callDock.hidden = true;
-  if (micButtonLabel) micButtonLabel.textContent = "Call";
-  setBotAudioMuted(true);
+  closeCallDock();
   // Keep transcript + thread_id so a reconnect in this window continues the chat.
 }
 
@@ -1163,7 +1121,12 @@ micButton.addEventListener("click", async () => {
   try {
     await refreshMicList({ requestPermission: true });
     await startVoiceCapture();
-    openCallDock();
+    await openCallDock();
+    // Unlock playback on the same click that started the call.
+    if (botAudio) {
+      botAudio.muted = false;
+      await botAudio.play().catch((err) => console.warn("Bot audio play failed", err));
+    }
   } catch (err) {
     console.warn("Voice mode start failed", err);
     showBanner("Could not start microphone: " + (err?.message || err));
@@ -1182,10 +1145,6 @@ voiceMute.addEventListener("click", () => {
   voiceMute.textContent = micMuted ? "Unmute" : "Mute";
   updateMicVisual(micMuted ? 0 : localMicLevel);
 });
-
-vadButton?.addEventListener("click", toggleVadMode);
-voiceVad?.addEventListener("click", toggleVadMode);
-syncVadButtons();
 
 micSelect.addEventListener("change", handleMicSelectChange);
 voiceMicSelect.addEventListener("change", handleMicSelectChange);
@@ -1214,7 +1173,9 @@ async function loadUiConfig() {
     if (!res.ok) return;
     const data = await res.json();
     debugMode = Boolean(data.debug_mode);
-    pipelineMode = data.voice_pipeline_default === "realtime" ? "realtime" : "cascade";
+    const realtimeOk = data.enabled_realtime !== false;
+    pipelineMode =
+      data.voice_pipeline_default === "realtime" && realtimeOk ? "realtime" : "cascade";
     if (backendLabel) backendLabel.textContent = formatBackendLabel(data);
     updateAvgResponse();
   } catch (err) {
