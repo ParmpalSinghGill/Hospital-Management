@@ -68,6 +68,17 @@ def test_list_doctors_department_and_preferred_time(isolated_db):
     assert timed["count"] >= 1
 
 
+def test_list_doctors_query_strips_dr_prefix(isolated_db):
+    """Agent often passes query='Dr. Name'; name matching must ignore the title."""
+    with_dr = _j(list_doctors, query="Dr. Test Cardio", limit=5)
+    bare = _j(list_doctors, query="Test Cardio", limit=5)
+    assert with_dr["ok"] is True
+    assert bare["ok"] is True
+    assert with_dr["count"] >= 1
+    assert with_dr["count"] == bare["count"]
+    assert any("Test Cardio" in (d.get("name") or "") for d in with_dr["doctors"])
+
+
 def test_book_cancel_reschedule_flow(isolated_db):
     booked = _j(
         book_appointment,

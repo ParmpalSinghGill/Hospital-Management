@@ -33,15 +33,16 @@ def list_doctors(
     )
     docs = _load_doctors()
     dep = (department or "").strip()
-    q = (query or "").strip().lower()
 
     def _norm_name(n: str) -> str:
-        n = n.strip().lower()
+        n = (n or "").strip().lower()
         if n.startswith("dr. "):
             n = n[4:]
         elif n.startswith("dr "):
             n = n[3:]
-        return n
+        return n.strip()
+
+    q = _norm_name(query or "")
 
     if dep:
         docs = [d for d in docs if department_matches(dep, d.get("department", ""))]
@@ -140,9 +141,20 @@ def list_doctors(
     }
     if message:
         payload["message"] = message
-    if dep and not docs:
-        payload["message"] = (
-            f"No doctors matched department '{dep}'. "
-            "Only then may you try a closely related department — not because of a busy time."
-        )
+    if not docs:
+        if q and dep:
+            payload["message"] = (
+                f"No doctor matched query '{query}' in department '{dep}'. "
+                "Retry list_doctors without query (or with the bare name, no Dr. prefix)."
+            )
+        elif q:
+            payload["message"] = (
+                f"No doctor matched query '{query}'. "
+                "Retry with the bare name (no Dr. prefix) or list by department."
+            )
+        elif dep:
+            payload["message"] = (
+                f"No doctors matched department '{dep}'. "
+                "Only then may you try a closely related department — not because of a busy time."
+            )
     return json.dumps(payload)

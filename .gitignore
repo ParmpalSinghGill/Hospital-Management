@@ -13,6 +13,7 @@ chats/
 metrics/
 app.log
 *.log
+.discord_bot.lock
 
 # --- Python ---
 __pycache__/

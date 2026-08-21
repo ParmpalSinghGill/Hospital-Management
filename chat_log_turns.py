@@ -30,6 +30,8 @@ def _channel_label(channel: str) -> str:
         return "web_app"
     if c in ("telegram", "tg"):
         return "telegram"
+    if c in ("discord", "dc"):
+        return "discord"
     return c or "web_app"
 
 def _empty_interaction(turn_number: int, mode: str = "text") -> dict[str, Any]:
