@@ -10,6 +10,13 @@ from langchain_core.callbacks import BaseCallbackHandler
 
 
 class LLMInspectHandler(BaseCallbackHandler):
+    """Prints raw prompts/responses to stdout — DEV ONLY.
+
+    This bypasses log redaction, so it is gated: it only prints when
+    ``LLM_INSPECT_STDOUT=1`` AND real-PHI mode is off (HIPAA off, or
+    SYNTHETIC_DATA_ONLY on). See ``inspect_handler()``.
+    """
+
     def on_llm_start(self, serialized, prompts, **kwargs):
         print("========= PROMPT SENT TO LLM ========")
         for p in prompts:
@@ -20,6 +27,15 @@ class LLMInspectHandler(BaseCallbackHandler):
         print("\n======== RAW RESPONSE FROM LLM ===")
         print(response)
         print("\n===================================\n")
+
+
+def inspect_handler():
+    """Return LLMInspectHandler only when explicitly enabled and no real PHI is in play."""
+    import security_config as _sc
+
+    enabled = (os.getenv("LLM_INSPECT_STDOUT") or "").strip().lower() in ("1", "true", "yes", "on")
+    real_phi = _sc.hipaa_mode() and not _sc.synthetic_data_only()
+    return LLMInspectHandler if (enabled and not real_phi) else None
 
 
 def _groq_model_name() -> str:
@@ -132,7 +148,7 @@ def _init_deepseek_model(callbacks_list) -> Any:
 
 
 def _init_model(
-    callbacks: Optional[type] = LLMInspectHandler,
+    callbacks: Optional[type] = None,
     provider: Optional[str] = None,
 ) -> Any:
     """Create the chat model used by Main.py LangGraph agents.
@@ -143,10 +159,8 @@ def _init_model(
       - ``glm`` — Zhipu / BigModel
       - ``openai`` — OpenAI Chat Completions (``gpt-5.6-luna``)
     """
-    if callbacks is not None:
-        callbacks_list = [callbacks()]
-    else:
-        callbacks_list = None
+    handler = callbacks if callbacks is not None else inspect_handler()
+    callbacks_list = [handler()] if handler is not None else None
 
     choice = (provider or os.getenv("LLM_PROVIDER") or "groq").strip().lower()
     canonical = {"glm": "glm", "zhipu": "glm", "zhipuai": "glm", "groq": "groq",

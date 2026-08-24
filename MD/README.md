@@ -35,4 +35,5 @@ Compliance work is documented step by step under [hipaa/](hipaa/):
 | 1 | [PHI data-flow map](hipaa/01-phi-data-flow-map.md) | done — 2026-08-21 |
 | 2 | [Security Risk Assessment](hipaa/02-security-risk-assessment.md) — risk register, safeguard gap analysis, vendor BAA table, remediation plan | done — 2026-08-21 |
 | 3 | [Technical remediation report](hipaa/03-technical-remediation-report.md) — what was changed in code, verification, what remains | done — 2026-08-21 |
+| 5 | [Security Risk Assessment R2](hipaa/05-security-risk-assessment-r2.md) — re-score of the hardened code + Langfuse tracing | done — 2026-08-24 |
 | 4 | Vendor BAAs, hosting, policies & training (administrative track) | next |

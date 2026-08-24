@@ -405,3 +405,31 @@ def test_mcp_bearer_middleware_refuses_websocket():
 
     msg = anyio.run(run)
     assert msg == {"type": "websocket.close", "code": 1008}
+
+
+# ------------------------------------------------- stdout prompt-leak (R2-02) ----
+def test_llm_inspect_handler_never_dumps_with_real_phi(secure_env, monkeypatch):
+    """LLMInspectHandler prints raw prompts/responses to stdout; it must be off
+    whenever real PHI can be in play (HIPAA on and SYNTHETIC_DATA_ONLY off)."""
+    import importlib
+
+    import Model
+
+    # real-PHI production posture, flag explicitly on → still refused
+    monkeypatch.setenv("HIPAA_MODE", "1")
+    monkeypatch.setenv("SYNTHETIC_DATA_ONLY", "0")
+    monkeypatch.setenv("LLM_INSPECT_STDOUT", "1")
+    importlib.reload(Model)
+    assert Model.inspect_handler() is None
+
+    # synthetic-dev posture, flag on → allowed (dev convenience)
+    monkeypatch.setenv("SYNTHETIC_DATA_ONLY", "1")
+    assert Model.inspect_handler() is Model.LLMInspectHandler
+
+    # flag off → never
+    monkeypatch.setenv("LLM_INSPECT_STDOUT", "0")
+    assert Model.inspect_handler() is None
+
+    # default _init_model no longer attaches a stdout dumper
+    import inspect as _inspect
+    assert _inspect.signature(Model._init_model).parameters["callbacks"].default is None
