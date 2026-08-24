@@ -34,7 +34,11 @@ def test_save_and_lookup_returning(isolated_db):
     assert first["ok"] is True
     assert first["is_returning"] is True
     assert first.get("verified") is False
-    assert first.get("confirm_name_from_db") == "Eve Tester"
+    assert first.get("needs_name") is True
+    # Phone alone never discloses the on-file record
+    assert "confirm_name_from_db" not in first
+    assert "patient" not in first
+    assert "Eve Tester" not in json.dumps(first)
 
     verified = _j(
         lookup_patient,
@@ -100,11 +104,13 @@ def test_book_cancel_reschedule_flow(isolated_db):
     )
     assert blocked["ok"] is False
 
-    moved = _j(reschedule_appointment, appointment_id=aid, new_time="2026-12-05 11:00")
+    moved = _j(reschedule_appointment, appointment_id=aid, new_time="2026-12-05 11:00", phone="9555555555")
     assert moved["ok"] is True, moved
     assert moved["appointment"]["time"] == "2026-12-05 11:00"
 
-    cancelled = _j(cancel_appointment, appointment_id=aid)
+    unauth = _j(cancel_appointment, appointment_id=aid)
+    assert unauth["ok"] is False and unauth.get("needs_phone") is True
+    cancelled = _j(cancel_appointment, appointment_id=aid, phone="9555555555")
     assert cancelled["ok"] is True
     assert cancelled["appointment"]["status"] == "CANCELLED"
 

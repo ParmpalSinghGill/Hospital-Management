@@ -69,15 +69,26 @@ from voice_bridge import (
 _ROOT = Path(__file__).resolve().parent
 load_dotenv(_ROOT / ".env", override=True)
 
+import security_config as sc  # noqa: E402
+from phi_redact import install_log_redaction  # noqa: E402
+
+# HIPAA posture: owner-only files, redacted logs, CORS locked to our origins.
+sc.harden_permissions()
+install_log_redaction()
+if not os.getenv("PIPECAT_ALLOWED_ORIGINS"):
+    os.environ["PIPECAT_ALLOWED_ORIGINS"] = ",".join(sc.allowed_origins())
+
 # Loguru → app.log (stdlib logging from graph/tools already writes here).
 logger.add(
-    _ROOT / "app.log",
+    sc.app_log_path(),
     level="INFO",
     format="{time:HH:mm:ss} - {level} - {message}",
     enqueue=True,
     rotation="20 MB",
     retention=5,
 )
+for _w in sc.startup_warnings():
+    logger.warning(f"[security] {_w}")
 
 try:
     from service_settings import apply_settings_to_env
@@ -154,6 +165,7 @@ def build_cascade_pipeline(
     ]
     stt = DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
+        mip_opt_out=True,
         live_options=LiveOptions(
             model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
             language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
@@ -166,11 +178,14 @@ def build_cascade_pipeline(
     tts = DeepgramTTSService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         voice=os.getenv("DEEPGRAM_VOICE", "aura-2-thalia-en"),
+        mip_opt_out=True,
     )
 
     call_key = call_id or thread_id
     state = shared_state if shared_state is not None else {}
-    graph_app = get_shared_hospital_graph(llm_provider=os.getenv("LLM_PROVIDER", "deepseek"))
+    # Resolve the provider from admin settings inside the helper (it calls
+    # apply_settings_to_env first) — passing os.getenv here could hand it a stale value.
+    graph_app = get_shared_hospital_graph()
     agent = make_langgraph_processor(
         thread_id, graph_app, call_id=call_key, shared_state=state
     )
@@ -269,6 +284,8 @@ def build_realtime_pipeline(transport: BaseTransport, context: LLMContext) -> Pi
     """OpenAI Realtime + hospital Tools.py handlers only."""
     tool_schemas = hospital_function_schemas()
 
+    if not sc.provider_allowed("openai"):
+        raise RuntimeError("OpenAI Realtime blocked: " + sc.provider_block_reason("openai"))
     llm = OpenAIRealtimeLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAIRealtimeLLMSettings(
@@ -528,6 +545,19 @@ _CHOOSER_HTML = """\
 """
 
 
+def _cache_control_for(path: str) -> str | None:
+    """Cache policy by path: APIs are never cached; UI files always revalidate.
+
+    ``no-cache`` still allows ETag/304s, so a plain reload picks up a new deploy or
+    an Admin change without a hard refresh. Anything else keeps framework defaults.
+    """
+    if path.startswith("/admin/api") or path.startswith("/api/"):
+        return "no-store"
+    if path == "/" or path.startswith(("/app", "/app-lite", "/admin", "/shared")):
+        return "no-cache"
+    return None
+
+
 def _mount_custom_client() -> None:
     from fastapi.responses import HTMLResponse
     from fastapi.staticfiles import StaticFiles
@@ -556,6 +586,30 @@ def _mount_custom_client() -> None:
     app.include_router(admin_router)
     app.include_router(log_router)
     app.include_router(tool_router)
+
+    @app.middleware("http")
+    async def _security_headers(request, call_next):  # type: ignore[no-untyped-def]
+        resp = await call_next(request)
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "no-referrer")
+        resp.headers.setdefault("Permissions-Policy", "camera=(), geolocation=()")
+        if sc.cookie_secure():
+            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        cache = _cache_control_for(request.url.path)
+        if cache:
+            resp.headers["Cache-Control"] = cache
+        return resp
+
+    # Retention purge + encrypted backups run daily in-process (HIPAA §164.310(d), §164.308(a)(7)).
+    try:
+        from backup import start_scheduler as _start_backups
+        from retention import start_scheduler as _start_retention
+
+        _start_retention()
+        _start_backups()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"schedulers not started: {exc}")
 
     @app.get("/", include_in_schema=False)
     async def root_chooser():

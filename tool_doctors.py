@@ -10,6 +10,8 @@ from database import (
     find_nearest_available_times,
     is_within_clinic_hours,
     normalize_appointment_time,
+    normalize_time_window,
+    time_window_from_text,
     rank_doctors_for_preferred_time,
     resolve_appointment_day,
 )
@@ -21,15 +23,22 @@ def list_doctors(
     query: Optional[str] = None,
     exclude_doctor: Optional[str] = None,
     preferred_time: Optional[str] = None,
+    time_window: Optional[str] = None,
     limit: int = 10,
 ) -> str:
-    """List doctors from the directory, optionally filtered by department or a name query."""
+    """List doctors, optionally filtered by department / name, ranked by availability.
+
+    time_window: None (default) = at/around preferred_time; 'after' = only slots at or
+    after preferred_time ("after 2 pm" -> preferred_time='2:00 PM', time_window='after');
+    'before' = only slots strictly before it ("before 2 pm" -> time_window='before').
+    """
     logging.info(
-        "list_doctors dep=%s query=%s exclude=%s preferred_time=%s",
+        "list_doctors dep=%s query=%s exclude=%s preferred_time=%s time_window=%s",
         department,
         query,
         exclude_doctor,
         preferred_time,
+        time_window,
     )
     docs = _load_doctors()
     dep = (department or "").strip()
@@ -55,6 +64,7 @@ def list_doctors(
         docs = [d for d in docs if _norm_name(d.get("name", "")) != ex]
 
     preferred = (preferred_time or "").strip()
+    window = normalize_time_window(time_window) or time_window_from_text(preferred)
     preferred_norm = normalize_appointment_time(preferred) if preferred else None
     preferred_day = resolve_appointment_day(preferred) if preferred else None
     preferred_unavailable = False
@@ -62,11 +72,24 @@ def list_doctors(
     day_only = bool(preferred and preferred_day and not preferred_norm)
 
     if preferred and (preferred_norm or preferred_day):
-        docs = rank_doctors_for_preferred_time(docs, preferred)
+        docs = rank_doctors_for_preferred_time(docs, preferred, time_window=window)
         free_only = [d for d in docs if d.get("free_at_preferred_time")]
         if free_only:
             docs = free_only
-            if day_only:
+            if window and not day_only:
+                sample = [
+                    f"{d.get('name')} at {d['nearest_times'][0]}"
+                    for d in docs[:3]
+                    if d.get("nearest_times")
+                ]
+                bound = "at or after" if window == "after" else "before"
+                message = (
+                    f"Doctors have open slots {bound} {preferred_norm or preferred}. "
+                    "Offer times from nearest_times (they already respect the window)"
+                    + (f" (e.g. {'; '.join(sample)})" if sample else "")
+                    + "."
+                )
+            elif day_only:
                 enriched = []
                 sample = []
                 for d in docs[: max(1, int(limit))]:
@@ -76,6 +99,7 @@ def list_doctors(
                         preferred,
                         limit=3,
                         search_days=1,
+                        time_window=window,
                     )
                     row["nearest_times"] = nearest
                     enriched.append(row)
@@ -108,6 +132,7 @@ def list_doctors(
                     preferred_norm or preferred,
                     limit=3,
                     search_days=3 if day_only else 3,
+                    time_window=window,
                 )
                 row["nearest_times"] = nearest
                 enriched.append(row)
@@ -138,6 +163,7 @@ def list_doctors(
         "preferred_time": preferred_norm or (preferred_day.isoformat() if preferred_day else None) or preferred or None,
         "preferred_time_unavailable": preferred_unavailable,
         "day_only_preference": day_only,
+        "time_window": window,
     }
     if message:
         payload["message"] = message

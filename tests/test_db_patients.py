@@ -50,7 +50,11 @@ def test_resolve_patient_returning_requires_name_confirm(isolated_db):
     result = db_patients._resolve_patient(phone="9111111111")
     assert result["ok"] is True
     assert result.get("is_returning") is True
-    assert result.get("confirm_name_from_db") == "Bob Builder"
+    assert result.get("needs_name") is True
+    assert result.get("patient") is None  # no disclosure before name check
+    assert "Bob Builder" not in json.dumps(result)
+    ok = db_patients._resolve_patient(phone="9111111111", patient_name="Bob Builder")
+    assert ok["verified"] is True and ok["patient"]["name"] == "Bob Builder"
 
 
 def test_resolve_patient_name_mismatch(isolated_db):

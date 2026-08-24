@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from pprint import pformat
 from typing import Annotated, Any, List, Literal, NotRequired, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
@@ -29,6 +28,7 @@ from hospital_routing import (
     _wants_prescriptions,
 )
 from llm_message_dump import agent_invoke_config
+from phi_redact import summarize_messages
 
 CHAT_LOG_PATH: str | None = None
 
@@ -60,7 +60,7 @@ def build_graph():
     router_agent = build_router_agent()
 
     def route_decider(state: GraphState) -> Literal["general", "booking", "cancelling", "rescheduling", "prescriptions"]:
-        logging.info(f"route_decider \n{pformat(state)}")
+        logging.info("route_decider %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
 
         sticky = _sticky_route_from_history(
@@ -75,7 +75,7 @@ def build_graph():
             {"messages": all_messages},
             config=agent_invoke_config("router", recursion_limit=8),
         )
-        logging.info(f"route_decider result \n{pformat(result['messages'][-1])}")
+        logging.info("route_decider result received")
 
         messages = result.get("messages", [])
         final_message = messages[-1] if messages else None
@@ -157,19 +157,19 @@ def build_graph():
             logging.error(f"Failed to append chat record: {e}")
 
     def general_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: general \n{pformat(state)}")
+        logging.info("Running node: general %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
         result = general_agent.invoke(
             {"messages": all_messages},
             config=agent_invoke_config("general", recursion_limit=12),
         )
-        logging.info(f"Running node: general result \n{pformat(result)}")
+        logging.info("Running node: general result %s", summarize_messages((result or {}).get("messages")))
         msgs = result.get("messages", [])
         _append_chat_record("general", all_messages, msgs)
         return {"messages": _new_messages_only(all_messages, msgs), "last_agent": "general"}
 
     def booking_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: booking \n{pformat(state)}")
+        logging.info("Running node: booking %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
         result = booking_agent.invoke(
             {"messages": all_messages},
@@ -180,7 +180,7 @@ def build_graph():
         return {"messages": _new_messages_only(all_messages, msgs), "last_agent": "booking"}
 
     def cancelling_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: cancelling \n{pformat(state)}")
+        logging.info("Running node: cancelling %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
         result = cancellation_agent.invoke(
             {"messages": all_messages},
@@ -191,7 +191,7 @@ def build_graph():
         return {"messages": _new_messages_only(all_messages, msgs), "last_agent": "cancelling"}
 
     def rescheduling_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: rescheduling \n{pformat(state)}")
+        logging.info("Running node: rescheduling %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
         result = reschedule_agent.invoke(
             {"messages": all_messages},
@@ -202,7 +202,7 @@ def build_graph():
         return {"messages": _new_messages_only(all_messages, msgs), "last_agent": "rescheduling"}
 
     def prescriptions_node(state: GraphState) -> GraphState:
-        logging.info(f"Running node: prescriptions \n{pformat(state)}")
+        logging.info("Running node: prescriptions %s", summarize_messages(state.get("messages")))
         all_messages = state.get("messages", [])
         result = prescription_agent.invoke(
             {"messages": all_messages},

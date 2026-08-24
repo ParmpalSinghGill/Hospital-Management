@@ -75,8 +75,8 @@ class InterruptTraceProcessor(FrameProcessor):
             logger.info(
                 f"Interrupt traced ({self._call_id}): "
                 f"phase={self._snapshot()[2]} "
-                f"user={self._state.get('last_user_text')!r} "
-                f"bot={(self._state.get('last_bot_text') or '')[:80]!r}"
+                f"user_chars={len(self._state.get('last_user_text') or '')} "
+                f"bot_chars={len(self._state.get('last_bot_text') or '')}"
             )
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._log("user_started_speaking")

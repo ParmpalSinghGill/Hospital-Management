@@ -21,7 +21,15 @@ from typing import Any
 from uuid import UUID
 
 _ROOT = Path(__file__).resolve().parent
-MESSAGES_ROOT = _ROOT / "chats" / "messages"
+try:
+    from security_config import chats_dir as _chats_dir, debug_dumps_allowed as _dumps_allowed
+
+    MESSAGES_ROOT = _chats_dir() / "messages"
+except Exception:  # noqa: BLE001
+    MESSAGES_ROOT = _ROOT / "chats" / "messages"
+
+    def _dumps_allowed() -> bool:  # type: ignore[no-redef]
+        return True
 
 _LOCK = threading.Lock()
 _COUNTERS: dict[str, int] = {}
@@ -29,6 +37,9 @@ _SAFE_SESSION = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def save_llm_messages_enabled() -> bool:
+    """Raw prompt/response dumps: admin toggle AND never while HIPAA_MODE is on."""
+    if not _dumps_allowed():
+        return False
     try:
         from service_settings import load_settings
 
@@ -293,12 +304,15 @@ def _stringify(value: Any) -> str:
         return str(value)
 
 
-def format_messages_block(messages: list[Any], *, title: str, node: str, n: int) -> str:
+def format_messages_block(
+    messages: list[Any], *, title: str, node: str, n: int, tools: list[Any] | None = None
+) -> str:
     lines = [
         f"llm_call: {n}",
         f"node: {node}",
         f"kind: {title}",
         f"message_count: {len(messages)}",
+        f"tool_count: {len(tools or [])}",
         f"saved_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')}",
         "",
         "===== EXACT PAYLOAD (JSON) =====",
@@ -317,6 +331,12 @@ def format_messages_block(messages: list[Any], *, title: str, node: str, n: int)
             lines.append(f"tool_call_id: {data['tool_call_id']}")
         if data.get("name"):
             lines.append(f"name: {data['name']}")
+        lines.append("")
+    if tools:
+        # Tool DEFINITIONS are not messages: the API request carries them in a
+        # separate top-level ``tools`` field next to ``messages`` (order-independent).
+        lines.append("===== TOOLS (request.tools — separate field, NOT part of messages) =====")
+        lines.append(json.dumps(tools, ensure_ascii=False, indent=2, default=str))
         lines.append("")
     return "\n".join(lines)
 
@@ -383,6 +403,7 @@ def save_llm_pair(
     response: Any,
     node: str = "",
     session_id: str | None = None,
+    tools: list[Any] | None = None,
 ) -> int | None:
     """Write Message{n}_passed.txt + Message{n}_response.txt. Returns n or None."""
     if not save_llm_messages_enabled():
@@ -392,7 +413,7 @@ def save_llm_pair(
         n = _next_n(sid)
         folder = _session_dir(sid)
         (folder / f"Message{n}_passed.txt").write_text(
-            format_messages_block(passed_messages, title="PASSED_TO_LLM", node=node, n=n),
+            format_messages_block(passed_messages, title="PASSED_TO_LLM", node=node, n=n, tools=tools),
             encoding="utf-8",
         )
         (folder / f"Message{n}_response.txt").write_text(
@@ -407,6 +428,11 @@ def save_llm_pair(
             "passed_file": f"Message{n}_passed.txt",
             "response_file": f"Message{n}_response.txt",
             "passed_message_count": len(passed_messages),
+            "tool_count": len(tools or []),
+            "tool_names": [
+                str(((t or {}).get("function") or {}).get("name") or (t or {}).get("name") or "")
+                for t in (tools or []) if isinstance(t, dict)
+            ],
             **vad_runtime_meta(),
         }
         # Prefer per-call session meta written at voice start (exact pipeline values).
@@ -440,6 +466,7 @@ def llm_dump_callbacks(node: str = "") -> list[Any]:
             super().__init__()
             self.agent_node = agent_node
             self._pending: dict[str, list[Any]] = {}
+            self._pending_tools: dict[str, list[Any]] = {}
 
         def on_chat_model_start(
             self,
@@ -454,6 +481,10 @@ def llm_dump_callbacks(node: str = "") -> list[Any]:
             for batch in messages or []:
                 flat.extend(list(batch or []))
             self._pending[str(run_id)] = flat
+            # Tool definitions travel in request.tools (bound via model.bind_tools), not
+            # in the message list — same source Langfuse reads (invocation_params.tools).
+            tools = (kwargs.get("invocation_params") or {}).get("tools")
+            self._pending_tools[str(run_id)] = list(tools) if isinstance(tools, list) else []
 
         def on_llm_start(
             self,
@@ -470,26 +501,41 @@ def llm_dump_callbacks(node: str = "") -> list[Any]:
         def on_llm_end(self, response: Any, *, run_id: UUID, **kwargs: Any) -> None:
             key = str(run_id)
             passed = self._pending.pop(key, None)
+            tools = self._pending_tools.pop(key, None)
             if passed is None:
                 passed = []
             save_llm_pair(
                 passed_messages=passed,
                 response=response,
                 node=self.agent_node,
+                tools=tools,
             )
 
         def on_llm_error(self, error: BaseException, *, run_id: UUID, **kwargs: Any) -> None:
             self._pending.pop(str(run_id), None)
+            self._pending_tools.pop(str(run_id), None)
 
     return [_LlmDumpCallback(node)]
 
 
 def agent_invoke_config(node: str, *, recursion_limit: int) -> dict[str, Any]:
-    """Config dict for agent.invoke with optional LLM dump callbacks."""
+    """Config dict for agent.invoke with optional LLM dump callbacks.
+
+    An explicit ``callbacks`` key REPLACES the callbacks a child would otherwise
+    inherit from the parent run (e.g. the Langfuse tracer attached in
+    ``run_turn``), so merge with the inherited ones instead of overriding them.
+    """
     cfg: dict[str, Any] = {"recursion_limit": recursion_limit}
     cbs = llm_dump_callbacks(node)
     if cbs:
-        cfg["callbacks"] = cbs
+        try:
+            from langchain_core.runnables.config import merge_configs, var_child_runnable_config
+
+            inherited = (var_child_runnable_config.get() or {}).get("callbacks")
+            merged = merge_configs({"callbacks": inherited}, {"callbacks": cbs})["callbacks"]
+            cfg["callbacks"] = merged if merged is not None else cbs
+        except Exception:  # noqa: BLE001
+            cfg["callbacks"] = cbs
     return cfg
 
 

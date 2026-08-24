@@ -8,6 +8,8 @@ Requires TELEGRAM_BOT_TOKEN in `.env`.
 
 from __future__ import annotations
 
+import security_config as sc
+
 import asyncio
 import os
 import sys
@@ -148,6 +150,9 @@ class TelegramBot:
         return list(data.get("result") or [])
 
     def _logged_turn(self, sess: TelegramSession, user_text: str) -> str:
+        if not sc.channel_may_carry_phi("telegram"):
+            # HIPAA_MODE: telegram cannot be covered by a BAA — never run the PHI agent here.
+            return sc.handoff_message()
         sess.ensure_started()
         set_current_call_id(sess.call_id)
         user_sent = _utc_iso()
@@ -218,7 +223,7 @@ class TelegramBot:
         try:
             reply = await asyncio.to_thread(self._logged_turn, sess, text)
         except Exception:
-            logger.exception("Telegram turn failed chat_id={}", chat_id)
+            logger.exception("Telegram turn failed chat_id=***")
             reply = "Something went wrong on my side. Please try again in a moment."
         await self.send_message(client, chat_id, reply)
 
@@ -278,7 +283,14 @@ def _chunk_text(text: str, limit: int) -> list[str]:
     return chunks
 
 
+def _hipaa_banner() -> None:
+    sc.harden_permissions()
+    if not sc.channel_may_carry_phi("telegram"):
+        logger.warning("HIPAA_MODE: Telegram runs as a NON-PHI hand-off channel (no booking, no transcripts).")
+
+
 def main() -> None:
+    _hipaa_banner()
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         raise SystemExit(

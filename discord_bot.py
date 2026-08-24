@@ -12,6 +12,8 @@ the Developer Portal if you want the bot to read every guild message.
 
 from __future__ import annotations
 
+import security_config as sc
+
 import asyncio
 import atexit
 import fcntl
@@ -190,6 +192,9 @@ class HospitalDiscordBot(discord.Client):
         print("Ctrl+C to stop.\n")
 
     def _logged_turn(self, sess: DiscordSession, user_text: str) -> str:
+        if not sc.channel_may_carry_phi("discord"):
+            # HIPAA_MODE: discord cannot be covered by a BAA — never run the PHI agent here.
+            return sc.handoff_message()
         sess.ensure_started()
         set_current_call_id(sess.call_id)
         user_sent = _utc_iso()
@@ -268,12 +273,15 @@ class HospitalDiscordBot(discord.Client):
             try:
                 reply = await asyncio.to_thread(self._logged_turn, sess, text)
             except Exception:
-                logger.exception("Discord turn failed user_id={}", message.author.id)
+                logger.exception("Discord turn failed user_id=***")
                 reply = "Something went wrong on my side. Please try again in a moment."
         await self._send_chunks(message.channel, reply)
 
 
 def main() -> None:
+    sc.harden_permissions()
+    if not sc.channel_may_carry_phi("discord"):
+        logger.warning("HIPAA_MODE: Discord runs as a NON-PHI hand-off channel (no booking, no transcripts).")
     _acquire_singleton_lock()
     token = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
     if not token:

@@ -8,13 +8,15 @@ from fastapi.testclient import TestClient
 
 
 @pytest.fixture
-def api_app(isolated_db, isolated_chats, monkeypatch):
+def api_app(isolated_db, isolated_chats, monkeypatch, tmp_path):
     import admin_routes
     import log_routes
     import tool_routes
 
-    monkeypatch.setattr(admin_routes, "ADMIN_USER", "Admin")
-    monkeypatch.setattr(admin_routes, "ADMIN_PASS", "test-secret")
+    import admin_auth
+
+    monkeypatch.setattr(admin_auth, "_users_path", lambda: tmp_path / "admin_users.json")
+    admin_auth.upsert_user("Admin", "test-secret-long-pass", role="admin")
 
     app = FastAPI()
     app.include_router(admin_routes.router)
@@ -32,7 +34,7 @@ def client(api_app):
 def authed(client):
     res = client.post(
         "/admin/api/login",
-        json={"username": "Admin", "password": "test-secret"},
+        json={"username": "Admin", "password": "test-secret-long-pass"},
     )
     assert res.status_code == 200
     assert res.json()["ok"] is True
@@ -139,11 +141,21 @@ def test_call_log_http_lifecycle(client, isolated_chats):
     )
     assert start.status_code == 200
     assert start.json()["ok"] is True
+    token = start.json()["call_token"]
+    assert token
+
+    # Without the per-call token nobody can write into the session
+    forged = client.post(
+        "/api/call-logs/event",
+        json={"call_id": "http-call-001", "type": "user_text", "text": "injected"},
+    )
+    assert forged.status_code == 403
 
     event = client.post(
         "/api/call-logs/event",
         json={
             "call_id": "http-call-001",
+            "call_token": token,
             "type": "user_text",
             "text": "I need a dentist",
         },
@@ -151,9 +163,13 @@ def test_call_log_http_lifecycle(client, isolated_chats):
     assert event.status_code == 200
     assert event.json()["ok"] is True
 
-    end = client.post("/api/call-logs/end", json={"call_id": "http-call-001"})
+    end = client.post("/api/call-logs/end", json={"call_id": "http-call-001", "call_token": token})
     assert end.status_code == 200
 
+    # Listing sessions is PHI → admin only
+    anon = client.get("/api/call-logs/recent", params={"limit": 10})
+    assert anon.status_code == 401
+    client.post("/admin/api/login", json={"username": "Admin", "password": "test-secret-long-pass"})
     recent = client.get("/api/call-logs/recent", params={"limit": 10})
     assert recent.status_code == 200
     sessions = recent.json()["sessions"]

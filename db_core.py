@@ -12,7 +12,16 @@ from typing import Any, Dict, Iterator, List
 BASE_DIR = os.path.dirname(__file__)
 
 
-DATASET_DIR = os.path.join(BASE_DIR, "dataset")
+def _dataset_dir() -> str:
+    try:
+        from security_config import dataset_dir
+
+        return str(dataset_dir())
+    except Exception:  # noqa: BLE001
+        return os.path.join(BASE_DIR, "dataset")
+
+
+DATASET_DIR = _dataset_dir()
 
 
 DB_PATH = os.path.join(DATASET_DIR, "hospital.db")

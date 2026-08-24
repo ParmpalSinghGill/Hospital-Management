@@ -90,14 +90,22 @@ function newCallId() {
   return `sess_${stamp}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
+let callToken = null; // issued by /api/call-logs/start; required for event/end
+
 async function postCallLog(path, payload) {
   try {
-    await fetch(`/api/call-logs/${path}`, {
+    const body = { ...payload };
+    if (path !== "start" && callToken) body.call_token = callToken;
+    const res = await fetch(`/api/call-logs/${path}`, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
+    if (path === "start" && res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (data && data.call_token) callToken = data.call_token;
+    }
   } catch (err) {
     console.warn("call log failed", path, err);
   }
@@ -126,6 +134,7 @@ async function endCallLog() {
   const id = callId;
   callId = null;
   await postCallLog("end", { call_id: id });
+  callToken = null;
 }
 
 function logClientEvent(type, extra = {}) {

@@ -120,6 +120,45 @@ def resolve_appointment_day(
     return _resolve_relative_date(s, now)
 
 
+_AFTER_PREF_RE = re.compile(
+    r"^\s*(?:any\s*time\s+)?(?:after|past|later\s+than|from)\s+", re.IGNORECASE
+)
+_BEFORE_PREF_RE = re.compile(
+    r"^\s*(?:any\s*time\s+)?(?:before|by|until|till|no\s+later\s+than|earlier\s+than)\s+",
+    re.IGNORECASE,
+)
+
+
+def is_after_preference(raw: str) -> bool:
+    """True for 'after 12pm'-style requests: only times >= the anchor qualify."""
+    return bool(_AFTER_PREF_RE.match(raw or ""))
+
+
+def is_before_preference(raw: str) -> bool:
+    """True for 'before 2pm'-style requests: only times < the anchor qualify."""
+    return bool(_BEFORE_PREF_RE.match(raw or ""))
+
+
+def time_window_from_text(raw: str) -> Optional[str]:
+    """'after' / 'before' when the phrase itself carries the direction, else None."""
+    if is_after_preference(raw):
+        return "after"
+    if is_before_preference(raw):
+        return "before"
+    return None
+
+
+def normalize_time_window(value: Optional[str]) -> Optional[str]:
+    """Coerce a tool argument to 'before' / 'after' / None."""
+    v = str(value or "").strip().lower()
+    return v if v in ("before", "after") else None
+
+
+def strip_after_preference(raw: str) -> str:
+    s = _AFTER_PREF_RE.sub("", raw or "", count=1)
+    return _BEFORE_PREF_RE.sub("", s, count=1).strip()
+
+
 def normalize_appointment_time(
     raw: str,
     *,
@@ -129,9 +168,11 @@ def normalize_appointment_time(
 
     Day-only phrases like 'today' return None — use resolve_appointment_day /
     find_nearest_available_times for availability. Soft clocks (morning/afternoon)
-    are accepted when a day is present.
+    are accepted when a day is present. 'after 3 pm' parses as '3 pm'. A bare
+    clock with no day ('12:00 PM') means the next occurrence: today if still
+    ahead, otherwise tomorrow.
     """
-    s = (raw or "").strip()
+    s = strip_after_preference((raw or "").strip())
     if not s:
         return None
     now = now or datetime.now()
@@ -161,9 +202,13 @@ def normalize_appointment_time(
 
     day = resolve_appointment_day(s, now=now)
     clock = _parse_clock_fragment(s) or _parse_soft_clock_fragment(s)
-    if day is None or clock is None:
+    if clock is None:
         return None
     hour, minute = clock
+    if day is None:
+        # Bare clock ('12:00 PM') → next occurrence: today if still ahead, else tomorrow.
+        candidate = datetime.combine(now.date(), dt_time(hour=hour, minute=minute))
+        day = now.date() if candidate >= now else now.date() + timedelta(days=1)
     try:
         dt = datetime.combine(day, dt_time(hour=hour, minute=minute))
     except ValueError:

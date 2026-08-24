@@ -4,6 +4,9 @@ import sqlite3
 
 from langchain_core.tools import tool
 
+from audit_log import audit, subject_ref
+from phi_redact import mask_phone
+
 from database import (
     _complete_past_appointments_for_patient,
     _enrich_appointment,
@@ -34,7 +37,7 @@ def book_appointment(
     address: str = "",
 ) -> str:
     """Book an appointment after validating doctor exists and time is free."""
-    logging.info("book_appointment %s %s %s %s", patient_name, phone, doctor, time)
+    logging.info("book_appointment phone=%s doctor=%s time=%s", mask_phone(phone), doctor, time)
     doctor_row = _get_doctor_by_name(doctor)
     if not doctor_row:
         return json.dumps({
@@ -60,14 +63,15 @@ def book_appointment(
 
     existing = _find_patient_by_phone(phone)
     if existing is not None and not _names_match(patient_name, str(existing.get("name", ""))):
+        audit("tool.book_appointment", actor="agent", outcome="name_mismatch", subject=subject_ref(phone=phone))
         return json.dumps({
             "ok": False,
             "message": (
-                f"Phone is already registered to {existing.get('name')} "
-                f"({existing.get('patient_id')}). Confirm the correct name before booking."
+                "The name given does not match our record for this phone number. Ask the caller "
+                "to repeat their full name as registered; do not suggest names or book."
             ),
             "name_mismatch": True,
-            "patient": existing,
+            "needs_name": True,
         })
 
     patient = _get_or_create_patient(
@@ -177,6 +181,7 @@ def book_appointment(
     except Exception:
         logging.exception("Failed to record booking chat for %s", patient.get("patient_id"))
 
+    _audit_booking(patient, new_appt)
     return json.dumps({
         "ok": True,
         "message": "Appointment booked",
@@ -187,41 +192,25 @@ def book_appointment(
     })
 
 
+def _audit_booking(patient: dict, appointment: dict) -> None:
+    audit("tool.book_appointment", actor="agent",
+          subject=subject_ref(patient_id=str((patient or {}).get("patient_id") or "")),
+          detail={"appointment_id": str((appointment or {}).get("appointment_id") or "")})
+
+
 @tool
 def cancel_appointment(
     appointment_id: str = "",
     phone: str = "",
+    patient_name: str = "",
 ) -> str:
-    """Cancel an existing appointment by ID, or by phone if the patient has one active appointment."""
-    logging.info("cancel_appointment id=%s phone=%s", appointment_id, phone)
+    """Cancel an appointment. Always pass the caller's phone (and full name when no
+    appointment_id is known). The phone must belong to the appointment's patient."""
+    logging.info("cancel_appointment id=%s phone=%s", appointment_id, mask_phone(phone))
 
-    appts = _load_all_appointments()
-    target = None
-    aid = (appointment_id or "").strip().upper()
-    if aid:
-        for a in appts:
-            if str(a.get("appointment_id", "")).upper() == aid:
-                target = a
-                break
-    elif (phone or "").strip():
-        patient = _find_patient_by_phone(phone)
-        if not patient:
-            return json.dumps({"ok": False, "message": "No patient found for that phone."})
-        target = _find_active_appointment_for_patient(str(patient.get("patient_id")), appts)
-        if target is None:
-            return json.dumps({
-                "ok": False,
-                "message": f"No active appointment found for {patient.get('name')}.",
-                "patient": patient,
-            })
-    else:
-        return json.dumps({
-            "ok": False,
-            "message": "Provide appointment_id or phone to cancel.",
-        })
-
-    if target is None:
-        return json.dumps({"ok": False, "message": f"Appointment not found: {appointment_id}"})
+    target, err = _authorize_appointment(appointment_id, phone, patient_name, action="cancel")
+    if err:
+        return json.dumps(err)
 
     if target.get("status") == "CANCELLED":
         return json.dumps({
@@ -232,6 +221,9 @@ def cancel_appointment(
 
     target["status"] = "CANCELLED"
     _update_appointment(target)
+    audit("tool.cancel_appointment", actor="agent",
+          subject=subject_ref(patient_id=str(target.get("patient_id") or "")),
+          detail={"appointment_id": target.get("appointment_id")})
     return json.dumps({
         "ok": True,
         "message": "Appointment cancelled",
@@ -239,48 +231,78 @@ def cancel_appointment(
     })
 
 
+def _authorize_appointment(appointment_id: str, phone: str, patient_name: str, *, action: str):
+    """Resolve the target appointment and prove the caller owns it.
+
+    Returns (appointment, None) or (None, error_payload).
+    """
+    aid = (appointment_id or "").strip().upper()
+    ph = (phone or "").strip()
+    name = (patient_name or "").strip()
+    if not ph:
+        return None, {
+            "ok": False,
+            "message": f"Ask for the caller's phone number before you {action} anything.",
+            "needs_phone": True,
+        }
+    patient = _find_patient_by_phone(ph)
+    if not patient:
+        return None, {"ok": False, "message": "No patient found for that phone.", "needs_phone": True}
+    if name and not _names_match(name, str(patient.get("name", ""))):
+        audit(f"tool.{action}_appointment", actor="agent", outcome="name_mismatch", subject=subject_ref(phone=ph))
+        return None, {
+            "ok": False,
+            "message": "The name given does not match our record for this phone. Ask them to repeat their full name.",
+            "name_mismatch": True,
+            "needs_name": True,
+        }
+    appts = _load_all_appointments()
+    if aid:
+        target = next((a for a in appts if str(a.get("appointment_id", "")).upper() == aid), None)
+        if target is None:
+            return None, {"ok": False, "message": f"Appointment not found: {appointment_id}"}
+        if str(target.get("patient_id") or "") != str(patient.get("patient_id") or ""):
+            audit(f"tool.{action}_appointment", actor="agent", outcome="not_owner",
+                  subject=subject_ref(patient_id=str(patient.get("patient_id") or "")),
+                  detail={"appointment_id": aid})
+            return None, {
+                "ok": False,
+                "message": "That appointment is not registered to this phone number. Verify the details with the caller.",
+                "not_owner": True,
+            }
+        return target, None
+    if not name:
+        return None, {
+            "ok": False,
+            "message": f"Ask for the caller's full name to verify before you {action} by phone.",
+            "needs_name": True,
+        }
+    target = _find_active_appointment_for_patient(str(patient.get("patient_id")), appts)
+    if target is None:
+        return None, {
+            "ok": False,
+            "message": "No active appointment found for this patient.",
+            "patient": patient,
+        }
+    return target, None
+
+
 @tool
 def reschedule_appointment(
     appointment_id: str = "",
     new_time: str = "",
     phone: str = "",
+    patient_name: str = "",
 ) -> str:
-    """Reschedule an existing appointment to a new time."""
-    logging.info(
-        "reschedule_appointment id=%s phone=%s new_time=%s",
-        appointment_id,
-        phone,
-        new_time,
-    )
+    """Reschedule an appointment to a new time. Always pass the caller's phone (and full
+    name when no appointment_id is known); the phone must belong to the appointment."""
+    logging.info("reschedule_appointment id=%s phone=%s new_time=%s", appointment_id, mask_phone(phone), new_time)
     if not (new_time or "").strip():
         return json.dumps({"ok": False, "message": "new_time is required."})
 
-    appts = _load_all_appointments()
-    target = None
-    aid = (appointment_id or "").strip().upper()
-    if aid:
-        for a in appts:
-            if str(a.get("appointment_id", "")).upper() == aid:
-                target = a
-                break
-        if target is None:
-            return json.dumps({"ok": False, "message": f"Appointment not found: {appointment_id}"})
-    elif (phone or "").strip():
-        patient = _find_patient_by_phone(phone)
-        if not patient:
-            return json.dumps({"ok": False, "message": "No patient found for that phone."})
-        target = _find_active_appointment_for_patient(str(patient.get("patient_id")), appts)
-        if target is None:
-            return json.dumps({
-                "ok": False,
-                "message": f"No active appointment found for {patient.get('name')}.",
-                "patient": patient,
-            })
-    else:
-        return json.dumps({
-            "ok": False,
-            "message": "Provide appointment_id or phone, plus the new_time.",
-        })
+    target, err = _authorize_appointment(appointment_id, phone, patient_name, action="reschedule")
+    if err:
+        return json.dumps(err)
 
     if target.get("status") == "CANCELLED":
         return json.dumps({"ok": False, "message": "Cannot reschedule a cancelled appointment."})
@@ -322,6 +344,9 @@ def reschedule_appointment(
     target["time"] = normalized_time
     try:
         _update_appointment(target)
+        audit("tool.reschedule_appointment", actor="agent",
+              subject=subject_ref(patient_id=str(target.get("patient_id") or "")),
+              detail={"appointment_id": target.get("appointment_id")})
     except sqlite3.IntegrityError:
         refusal = check_slot_bookable(
             doctor_id,

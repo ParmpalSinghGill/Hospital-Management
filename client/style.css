@@ -199,6 +199,28 @@ body {
   border-color: var(--teal-deep);
   background: rgba(26, 107, 99, 0.06);
 }
+.mic-master {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--danger);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.45rem 0.75rem;
+  border-radius: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mic-master svg { opacity: 0.85; }
+.mic-master:hover { border-color: currentColor; }
+.mic-master.on {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: rgba(31, 122, 76, 0.08);
+}
 #backend-label {
   font-size: 0.8rem;
   font-weight: 600;

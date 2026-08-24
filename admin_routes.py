@@ -10,8 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Cookie, HTTPException, Query, Response
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Cookie, HTTPException, Query, Response, Request
+from fastapi.responses import RedirectResponse, FileResponse
 from pydantic import BaseModel
 
 from conversation_log import (
@@ -39,58 +39,59 @@ from database import (
     parse_appointment_datetime,
     remove_doctor_unavailable,
 )
+import admin_auth
+import security_config as sc
+from audit_log import audit
 from service_settings import (
     apply_settings_to_env,
     is_provider_enabled,
+    llm_model_for,
     load_settings,
     options_catalog,
     resolve_voice_pipeline,
     save_settings,
 )
 
-ADMIN_USER = os.getenv("ADMIN_USER", "Admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "12345")
-
-_SECRET_PATH = Path(__file__).resolve().parent / ".admin_token_secret"
-if os.getenv("ADMIN_TOKEN_SECRET"):
-    _TOKEN_SECRET = os.getenv("ADMIN_TOKEN_SECRET")
-elif _SECRET_PATH.exists():
-    _TOKEN_SECRET = _SECRET_PATH.read_text(encoding="utf-8").strip() or secrets.token_hex(16)
-else:
-    _TOKEN_SECRET = secrets.token_hex(16)
-    try:
-        _SECRET_PATH.write_text(_TOKEN_SECRET, encoding="utf-8")
-    except OSError:
-        pass
-
 _ADMIN_DIR = Path(__file__).resolve().parent / "admin"
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+# Kept for backwards-compatible monkeypatching in tests; real auth lives in admin_auth.
+ADMIN_USER = os.getenv("ADMIN_USER", "")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "")
 
-def _make_token(username: str) -> str:
-    sig = hmac.new(
-        _TOKEN_SECRET.encode(),
-        username.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return f"{username}.{sig}"
+
+def _session(admin_token: str | None):
+    return admin_auth.resolve_session(admin_token)
 
 
 def _valid_token(token: str | None) -> bool:
-    if not token or "." not in token:
-        return False
-    user, sig = token.split(".", 1)
-    expected = hmac.new(
-        _TOKEN_SECRET.encode(),
-        user.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(sig, expected) and user == ADMIN_USER
+    return _session(token) is not None
 
 
-def _require_auth(admin_token: str | None) -> None:
-    if not _valid_token(admin_token):
+def _require_auth(admin_token: str | None, *, role: str = "viewer") -> str:
+    """Return the username or raise 401/403. ``role='admin'`` for write actions."""
+    sess = _session(admin_token)
+    if not sess:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if role == "admin" and sess.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return sess.username
+
+
+def _client_key(request: Request | None) -> str:
+    if request is None:
+        return ""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def _gated_page(name: str, admin_token: str | None):
+    """Serve an admin HTML page only with a live session; otherwise go to login."""
+    if not _valid_token(admin_token):
+        return RedirectResponse(url="/admin/", status_code=303)
+    return _page(name)
 
 
 def _page(name: str) -> FileResponse:
@@ -123,6 +124,7 @@ class SettingsBody(BaseModel):
     glm_model: str | None = None
     groq_model: str | None = None
     deepseek_model: str | None = None
+    openai_chat_model: str | None = None
     openai_realtime_model: str | None = None
     openai_realtime_voice: str | None = None
     debug_mode: bool | None = None
@@ -144,67 +146,72 @@ async def admin_page():
 
 
 @router.get("/appointments")
-async def appointments_page():
-    return _page("appointments.html")
+async def appointments_page(admin_token: str | None = Cookie(default=None)):
+    return _gated_page("appointments.html", admin_token)
 
 
 @router.get("/patients")
-async def patients_page():
-    return _page("patients.html")
+async def patients_page(admin_token: str | None = Cookie(default=None)):
+    return _gated_page("patients.html", admin_token)
 
 
 @router.get("/patient")
 @router.get("/patient/{patient_id}")
-async def patient_page(patient_id: str | None = None):
-    return _page("patient.html")
+async def patient_page(patient_id: str | None = None, admin_token: str | None = Cookie(default=None)):
+    return _gated_page("patient.html", admin_token)
 
 
 @router.get("/doctors")
-async def doctors_page():
-    return _page("doctors.html")
+async def doctors_page(admin_token: str | None = Cookie(default=None)):
+    return _gated_page("doctors.html", admin_token)
 
 
 @router.get("/doctor")
 @router.get("/doctor/{doctor_id}")
-async def doctor_page(doctor_id: str | None = None):
-    return _page("doctor.html")
+async def doctor_page(doctor_id: str | None = None, admin_token: str | None = Cookie(default=None)):
+    return _gated_page("doctor.html", admin_token)
 
 
 @router.get("/messages")
-async def messages_page():
-    return _page("messages.html")
+async def messages_page(admin_token: str | None = Cookie(default=None)):
+    return _gated_page("messages.html", admin_token)
 
 
 # -------- Auth / settings --------
 @router.post("/api/login")
-async def login(body: LoginBody, response: Response):
+async def login(body: LoginBody, response: Response, request: Request):
     username = (body.username or "").strip()
-    password = body.password or ""
-    if username != ADMIN_USER or password != ADMIN_PASS:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-    token = _make_token(username)
-    response.set_cookie(
-        key="admin_token",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=60 * 60 * 12,
-        path="/",
-    )
-    return {"ok": True, "user": username}
+    try:
+        user, token = admin_auth.login(username, body.password or "", client_key=_client_key(request))
+    except admin_auth.LoginError as exc:
+        audit("admin.login", actor=username or "?", outcome="fail", detail={"reason": str(exc), "ip": _client_key(request)})
+        headers = {"Retry-After": str(int(exc.retry_after))} if exc.retry_after else None
+        raise HTTPException(status_code=exc.status, detail=str(exc), headers=headers) from None
+    response.set_cookie(key="admin_token", value=token, **admin_auth.cookie_kwargs())
+    audit("admin.login", actor=user.username, detail={"role": user.role, "ip": _client_key(request)})
+    return {"ok": True, "user": user.username, "role": user.role}
 
 
 @router.post("/api/logout")
-async def logout(response: Response):
+async def logout(response: Response, admin_token: str | None = Cookie(default=None)):
+    sess = _session(admin_token)
+    admin_auth.revoke_session(admin_token)
     response.delete_cookie("admin_token", path="/")
+    if sess:
+        audit("admin.logout", actor=sess.username)
     return {"ok": True}
 
 
 @router.get("/api/session")
 async def session(admin_token: str | None = Cookie(default=None)):
-    if not _valid_token(admin_token):
-        return {"authenticated": False}
-    return {"authenticated": True, "user": ADMIN_USER}
+    sess = _session(admin_token)
+    if not sess:
+        problem = admin_auth.configuration_problem()
+        out: dict[str, Any] = {"authenticated": False}
+        if problem:
+            out["setup_required"] = problem
+        return out
+    return {"authenticated": True, "user": sess.username, "role": sess.role}
 
 
 @router.get("/api/ui-config")
@@ -215,7 +222,9 @@ async def ui_config():
         "debug_mode": bool(s.get("debug_mode", False)),
         "voice_pipeline_default": resolve_voice_pipeline(s),
         "cascade_llm": s.get("cascade_llm") or "deepseek",
+        "cascade_llm_model": llm_model_for(s, s.get("cascade_llm") or "deepseek"),
         "cli_llm": s.get("cli_llm") or "groq",
+        "cli_llm_model": llm_model_for(s, s.get("cli_llm") or "groq"),
         "stt": s.get("stt") or "deepgram",
         "tts": s.get("tts") or "deepgram",
         "enabled_realtime": is_provider_enabled(s, "realtime"),
@@ -225,21 +234,32 @@ async def ui_config():
 
 @router.get("/api/credits")
 async def credits(admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.credits.read", actor=_actor)
     reports = await collect_credit_reports()
     return {"providers": reports}
 
 
 @router.get("/api/settings")
 async def get_settings(admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.settings.read", actor=_actor)
     apply_settings_to_env()
     return {"settings": load_settings(), "options": options_catalog()}
 
 
 @router.put("/api/settings")
 async def put_settings(body: SettingsBody, admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.settings.update", actor=_actor)
+    if body.save_llm_messages and not sc.debug_dumps_allowed():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Raw LLM message dumps are disabled with real data. Set SYNTHETIC_DATA_ONLY=1 "
+                "while developing, or LLM_QA_DUMPS=1 for audited, short-retention QA dumps."
+            ),
+        )
     # exclude_unset keeps explicit False values (enable_openai=false, etc.).
     updates = body.model_dump(exclude_unset=True)
     if "enabled_providers" in updates and updates["enabled_providers"] is not None:
@@ -256,7 +276,7 @@ async def put_settings(body: SettingsBody, admin_token: str | None = Cookie(defa
 # -------- Hospital data APIs --------
 @router.get("/api/departments")
 async def departments(admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
     deps = sorted({(d.get("department") or "").strip() for d in _load_doctors() if d.get("department")})
     return {"ok": True, "departments": deps}
 
@@ -266,7 +286,7 @@ async def doctors(
     department: Optional[str] = Query(default=None),
     admin_token: str | None = Cookie(default=None),
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
     ensure_default_lunch_breaks()
     docs = _load_doctors()
     dep = (department or "").strip()
@@ -289,7 +309,7 @@ async def doctor_schedule(
     admin_token: str | None = Cookie(default=None),
 ):
     """8×6 day grid for one doctor (09:00–17:00, 10-minute slots)."""
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
     ensure_default_lunch_breaks()
     day_key = (day or "").strip() or datetime.now().strftime("%Y-%m-%d")
     try:
@@ -305,7 +325,8 @@ async def doctor_unavailable_add(
     body: UnavailableBody,
     admin_token: str | None = Cookie(default=None),
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.doctor.unavailable.add", actor=_actor)
     try:
         block = add_doctor_unavailable(
             doctor_id,
@@ -325,7 +346,8 @@ async def doctor_unavailable_delete(
     block_id: str,
     admin_token: str | None = Cookie(default=None),
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.doctor.unavailable.delete", actor=_actor)
     if not remove_doctor_unavailable(block_id):
         raise HTTPException(status_code=404, detail="Block not found")
     return {"ok": True, "removed": block_id}
@@ -341,7 +363,8 @@ async def appointments(
     admin_token: str | None = Cookie(default=None),
 ):
     """Future (or all) appointments, filterable by department / doctor."""
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.appointments.read", actor=_actor)
     now = datetime.now()
     dep = (department or "").strip().lower()
     doc_id = (doctor_id or "").strip().upper()
@@ -384,7 +407,8 @@ async def patients(
     q: Optional[str] = Query(default=None),
     admin_token: str | None = Cookie(default=None),
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.patients.list", actor=_actor)
     query = (q or "").strip().lower()
     rows = _load_patients()
     if query:
@@ -408,7 +432,8 @@ async def patients(
 
 @router.get("/api/patients/{patient_id}")
 async def patient_detail(patient_id: str, admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.patient.read", actor=_actor, subject={"patient_id": patient_id})
     patient = _get_patient_by_id(patient_id)
     if not patient:
         raise HTTPException(status_code=404, detail=f"Patient not found: {patient_id}")
@@ -448,7 +473,8 @@ async def patient_detail(patient_id: str, admin_token: str | None = Cookie(defau
 
 @router.get("/api/patients/{patient_id}/chats")
 async def patient_chats(patient_id: str, admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.patient.chats.read", actor=_actor, subject={"patient_id": patient_id})
     patient = _get_patient_by_id(patient_id)
     if not patient:
         raise HTTPException(status_code=404, detail=f"Patient not found: {patient_id}")
@@ -458,7 +484,8 @@ async def patient_chats(patient_id: str, admin_token: str | None = Cookie(defaul
 
 @router.get("/api/chats/{session_id}")
 async def chat_detail(session_id: str, admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.chat.read", actor=_actor, session_id=session_id)
     detail = get_call_detail(session_id)
     if not detail:
         raise HTTPException(status_code=404, detail=f"Chat not found: {session_id}")
@@ -468,7 +495,7 @@ async def chat_detail(session_id: str, admin_token: str | None = Cookie(default=
 @router.get("/api/response-timings")
 async def response_timings(admin_token: str | None = Cookie(default=None)):
     """Average first-text / first-speech latency across all chats/sessions."""
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
     from conversation_log import summarize_response_timings
 
     return summarize_response_timings()
@@ -476,7 +503,8 @@ async def response_timings(admin_token: str | None = Cookie(default=None)):
 
 @router.delete("/api/chats/{session_id}")
 async def chat_delete(session_id: str, admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.chat.delete", actor=_actor, session_id=session_id)
     if not delete_call(session_id):
         raise HTTPException(status_code=404, detail=f"Chat not found: {session_id}")
     return {"ok": True, "deleted": session_id}
@@ -485,7 +513,8 @@ async def chat_delete(session_id: str, admin_token: str | None = Cookie(default=
 @router.get("/api/llm-messages/sessions")
 async def llm_message_sessions(admin_token: str | None = Cookie(default=None)):
     """List LLM dump sessions — oldest first for analysis."""
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.llm_dumps.list", actor=_actor)
     from llm_message_dump import list_llm_message_sessions
 
     sessions = list_llm_message_sessions(oldest_first=True)
@@ -495,7 +524,8 @@ async def llm_message_sessions(admin_token: str | None = Cookie(default=None)):
 @router.delete("/api/llm-messages/sessions")
 @router.post("/api/llm-messages/delete-all")
 async def llm_message_sessions_delete_all(admin_token: str | None = Cookie(default=None)):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.llm_dumps.delete_all", actor=_actor)
     from llm_message_dump import delete_all_llm_messages
 
     removed = delete_all_llm_messages()
@@ -507,7 +537,8 @@ async def llm_message_sessions_delete_all(admin_token: str | None = Cookie(defau
 async def llm_message_session_delete(
     session_id: str, admin_token: str | None = Cookie(default=None)
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token, role="admin")
+    audit("admin.llm_dumps.delete", actor=_actor)
     from llm_message_dump import delete_session_messages
 
     # Idempotent: missing folder still counts as deleted for the UI.
@@ -519,7 +550,8 @@ async def llm_message_session_delete(
 async def llm_message_session_detail(
     session_id: str, admin_token: str | None = Cookie(default=None)
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.llm_dumps.read", actor=_actor)
     from llm_message_dump import list_session_pairs, read_session_runtime_meta
 
     pairs = list_session_pairs(session_id)
@@ -538,7 +570,8 @@ async def llm_message_session_detail(
 async def llm_message_pair(
     session_id: str, n: int, admin_token: str | None = Cookie(default=None)
 ):
-    _require_auth(admin_token)
+    _actor = _require_auth(admin_token)
+    audit("admin.llm_dumps.read", actor=_actor)
     from llm_message_dump import list_session_pairs, read_session_pair
 
     pair = read_session_pair(session_id, n)
@@ -555,3 +588,18 @@ async def llm_message_pair(
         "prev_n": nums[idx - 1] if idx > 0 else None,
         "next_n": nums[idx + 1] if 0 <= idx < len(nums) - 1 else None,
     }
+
+
+@router.get("/api/audit")
+async def audit_recent(
+    limit: int = Query(default=200, ge=1, le=1000),
+    event: str = "",
+    admin_token: str | None = Cookie(default=None),
+):
+    """Most recent audit records (newest first) + chain verification status."""
+    _actor = _require_auth(admin_token, role="admin")
+    from audit_log import recent as _recent, verify_chain
+
+    rows = _recent(limit=limit, event_prefix=event or "")
+    audit("admin.audit.read", actor=_actor, detail={"count": len(rows)})
+    return {"ok": True, "count": len(rows), "chain": verify_chain(), "records": rows}

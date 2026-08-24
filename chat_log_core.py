@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 _ROOT = Path(__file__).resolve().parent
-CHATS_DIR = Path(os.environ.get("CHAT_LOGS_DIR", _ROOT / "chats"))
+try:
+    from security_config import chats_dir as _chats_dir
+
+    CHATS_DIR = _chats_dir()
+except Exception:  # noqa: BLE001 — fall back to legacy location
+    CHATS_DIR = Path(os.environ.get("CHAT_LOGS_DIR", _ROOT / "chats"))
 SESSIONS_DIR = CHATS_DIR / "sessions"
 TOOL_CALL_PATH = CHATS_DIR / "tool_call.json"
 TIMELINE_PATH = CHATS_DIR / "timeline.jsonl"

@@ -25,13 +25,18 @@ from hospital_routing import (  # noqa: F401
     _wants_prescriptions,
 )
 
-logfile = "app.log"
+import security_config as _sc  # noqa: E402
+from phi_redact import install_log_redaction as _install_log_redaction  # noqa: E402
+
+_sc.harden_permissions()
+logfile = str(_sc.app_log_path())
 logging.basicConfig(
     filename=logfile,
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
 )
+_install_log_redaction()
 
 
 def main():

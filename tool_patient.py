@@ -4,6 +4,23 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from audit_log import audit, subject_ref
+from phi_redact import mask_phone
+from rate_limit import RateLimiter
+
+# Per-session identity attempts: 8 lookups / 10 min, 3 failed name checks / 10 min.
+_LOOKUP_LIMIT = RateLimiter(max_events=8, window_secs=600)
+_MISMATCH_LIMIT = RateLimiter(max_events=3, window_secs=600)
+
+
+def _session_key() -> str:
+    try:
+        from conversation_log import get_current_call_id
+
+        return get_current_call_id() or "anon"
+    except Exception:  # noqa: BLE001
+        return "anon"
+
 from database import (
     _complete_past_appointments_for_patient,
     _enrich_appointment,
@@ -29,17 +46,26 @@ def lookup_patient(
 ) -> str:
     """Look up a patient. Phone is the primary key — always ask phone first.
 
-    Names are not unique. Never identify someone from name alone or from chat memory.
-    After phone lookup: if returning, confirm the name returned in confirm_name_from_db;
-    if new, ask for their full name then save_patient.
+    Identity = phone AND full name, both supplied by the caller. The tool never
+    reveals the name or phone on file. Flow: ask phone → lookup_patient(phone=...)
+    → if is_returning, ask their full name → lookup_patient(phone=..., patient_name=...)
+    → verified=true returns the record. If is_new, ask full name then save_patient.
     """
     logging.info(
         "lookup_patient id=%s phone=%s name=%s department=%s",
         patient_id,
-        phone,
-        patient_name,
+        mask_phone(phone),
+        "yes" if (patient_name or "").strip() else "no",
         department,
     )
+    skey = _session_key()
+    if not _LOOKUP_LIMIT.allow(skey):
+        audit("tool.lookup_patient", actor="agent", session_id=skey, outcome="rate_limited")
+        return json.dumps({
+            "ok": False,
+            "message": "Too many lookup attempts in this conversation. Please try again later.",
+            "rate_limited": True,
+        })
 
     phone_s = (phone or "").strip()
     name_s = (patient_name or "").strip()
@@ -52,6 +78,14 @@ def lookup_patient(
             "needs_phone": True,
         })
 
+    if pid_s and not phone_s:
+        # A patient id alone is guessable; require the phone as a second factor.
+        return json.dumps({
+            "ok": False,
+            "message": "Ask for the phone number registered with this patient id to verify.",
+            "needs_phone": True,
+        })
+
     resolved = _resolve_patient(
         patient_id=pid_s or None,
         phone=phone_s or None,
@@ -59,31 +93,42 @@ def lookup_patient(
         require_name_with_phone=False,
     )
 
-    def _confirm_fields(src: dict) -> dict:
-        out = {}
-        if src.get("confirm_name_from_db"):
-            out["confirm_name_from_db"] = src.get("confirm_name_from_db")
-        if src.get("confirm_phone_from_db"):
-            out["confirm_phone_from_db"] = src.get("confirm_phone_from_db")
-        if src.get("name_match_count") is not None:
-            out["name_match_count"] = src.get("name_match_count")
-        return out
-
     if resolved.get("name_mismatch"):
-        payload = {
+        audit(
+            "tool.lookup_patient", actor="agent", session_id=skey, outcome="name_mismatch",
+            subject=subject_ref(phone=phone_s),
+        )
+        if not _MISMATCH_LIMIT.allow(skey):
+            return json.dumps({
+                "ok": False,
+                "message": (
+                    "Identity could not be verified after several attempts. Ask the caller to "
+                    "contact the front desk directly."
+                ),
+                "name_mismatch": True,
+                "locked": True,
+                "needs_name": False,
+                "needs_phone": False,
+            })
+        return json.dumps({
             "ok": False,
             "message": resolved.get("message"),
             "name_mismatch": True,
-            "patient": resolved.get("patient"),
             "is_returning": True,
             "needs_phone": not bool(phone_s),
             "needs_name": True,
-        }
-        payload.update(_confirm_fields(resolved))
-        if resolved.get("patient"):
-            payload["confirm_name_from_db"] = (resolved.get("patient") or {}).get("name")
-            payload["confirm_phone_from_db"] = (resolved.get("patient") or {}).get("phone")
-        return json.dumps(payload)
+        })
+
+    if resolved.get("is_returning") and resolved.get("needs_name") and not resolved.get("patient"):
+        return json.dumps({
+            "ok": True,
+            "is_returning": True,
+            "is_new": False,
+            "verified": False,
+            "needs_name": True,
+            "needs_phone": False,
+            "message": resolved.get("message"),
+        })
 
     if resolved.get("is_new"):
         return json.dumps({
@@ -104,11 +149,11 @@ def lookup_patient(
             "message": resolved.get("message"),
             "needs_phone": resolved.get("needs_phone", False),
             "needs_name": resolved.get("needs_name", False),
-            "patient": resolved.get("patient"),
         }
         if resolved.get("incomplete_phone"):
             payload["incomplete_phone"] = True
-        payload.update(_confirm_fields(resolved))
+        if resolved.get("name_match_count") is not None:
+            payload["name_match_count"] = resolved.get("name_match_count")
         return json.dumps(payload)
 
     patient = resolved.get("patient")
@@ -128,19 +173,10 @@ def lookup_patient(
         active_enriched = dict(active_enriched)
         active_enriched["timing"] = timing
 
-    confirm_name = resolved.get("confirm_name_from_db") or patient.get("name")
-    confirm_phone = resolved.get("confirm_phone_from_db") or patient.get("phone")
-    name_confirmed = bool(name_s) and _names_match(name_s, str(confirm_name or ""))
-
-    if not name_confirmed:
-        msg = (
-            f"Phone matches patient {patient.get('patient_id')}. "
-            f"Confirm name from database: ask 'Are you {confirm_name}?' and wait for yes. "
-            f"Then call lookup_patient(phone=..., patient_name={confirm_name!r}) "
-            "before discussing appointments. "
-            "Do NOT say there is no appointment while active_appointment is present below."
-        )
-    elif active_enriched:
+    # Reaching here means phone + name matched (or id + phone matched): verified.
+    name_confirmed = True
+    confirm_name = patient.get("name")
+    if active_enriched:
         msg = (
             f"Patient verified as {confirm_name}. Active appointment "
             f"{active_enriched.get('appointment_id')} with {active_enriched.get('doctor')} "
@@ -175,20 +211,22 @@ def lookup_patient(
     except Exception:
         pass
 
+    audit(
+        "tool.lookup_patient", actor="agent", session_id=skey,
+        subject=subject_ref(patient_id=str(patient.get("patient_id") or "")),
+    )
     payload = {
         "ok": True,
         "is_returning": True,
         "is_new": False,
-        "verified": name_confirmed,
-        "needs_name": not name_confirmed,
+        "verified": True,
+        "needs_name": False,
         "needs_phone": False,
         "message": msg,
         "patient": patient,
         "past_doctors": past,
         "last_doctor": (past[0] if past else None),
         "active_appointment": active_enriched,
-        "confirm_name_from_db": confirm_name,
-        "confirm_phone_from_db": confirm_phone,
     }
     if guidance:
         payload["booking_guidance"] = guidance
@@ -203,7 +241,7 @@ def save_patient(
     address: str = "",
 ) -> str:
     """Create or update a patient record after phone and name are confirmed."""
-    logging.info("save_patient %s %s", patient_name, phone)
+    logging.info("save_patient phone=%s", mask_phone(phone))
     name = (patient_name or "").strip()
     ph = (phone or "").strip()
     if not name:
@@ -223,14 +261,17 @@ def save_patient(
 
     existing = _find_patient_by_phone(ph)
     if existing is not None and not _names_match(name, str(existing.get("name", ""))):
+        audit("tool.save_patient", actor="agent", session_id=_session_key(), outcome="phone_conflict",
+              subject=subject_ref(phone=ph))
         return json.dumps({
             "ok": False,
             "message": (
-                f"Phone is already registered to {existing.get('name')} "
-                f"({existing.get('patient_id')}). Confirm the correct name."
+                "This phone number is already registered under a different name. Ask the caller "
+                "to re-check the digits; if the number is right, the front desk must update "
+                "the record — do not create or reveal anything."
             ),
-            "name_mismatch": True,
-            "patient": existing,
+            "phone_conflict": True,
+            "needs_phone": True,
         })
 
     before_id = existing.get("patient_id") if existing else None
@@ -248,6 +289,9 @@ def save_patient(
             )
     except Exception:
         pass
+    audit("tool.save_patient", actor="agent", session_id=_session_key(),
+          outcome="created" if created else "updated",
+          subject=subject_ref(patient_id=str((patient or {}).get("patient_id") or "")))
     return json.dumps({
         "ok": True,
         "message": "Patient saved" if created else "Patient updated",

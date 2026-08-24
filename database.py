@@ -48,6 +48,8 @@ from db_time import (  # noqa: F401
     classify_appointment_timing,
     is_within_clinic_hours,
     normalize_appointment_time,
+    normalize_time_window,
+    time_window_from_text,
     parse_appointment_datetime,
     parse_availability_anchor,
     resolve_appointment_day,

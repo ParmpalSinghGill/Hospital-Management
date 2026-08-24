@@ -279,6 +279,7 @@ async function loadSettings() {
   setFieldValue("glm_model", s.glm_model);
   setFieldValue("groq_model", s.groq_model);
   setFieldValue("deepseek_model", s.deepseek_model);
+  setFieldValue("openai_chat_model", s.openai_chat_model);
   setFieldValue("openai_realtime_model", s.openai_realtime_model);
   const debugEl = document.getElementById("debug_mode");
   if (debugEl) debugEl.checked = Boolean(s.debug_mode);
@@ -381,6 +382,7 @@ async function saveSettings() {
     glm_model: document.getElementById("glm_model")?.value,
     groq_model: document.getElementById("groq_model")?.value,
     deepseek_model: document.getElementById("deepseek_model")?.value,
+    openai_chat_model: document.getElementById("openai_chat_model")?.value,
     openai_realtime_model: document.getElementById("openai_realtime_model")?.value,
     openai_realtime_voice: document.getElementById("openai_realtime_voice")?.value,
     debug_mode: Boolean(document.getElementById("debug_mode")?.checked),

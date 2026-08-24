@@ -25,3 +25,14 @@ Want a quick terminal test?   →  CLI
 ```
 
 All channels share the same appointment tools and SQLite DB (`dataset/hospital.db`). You can run several at once (e.g. web on 7860 + MCP on 8000 + Discord) as separate processes.
+
+## HIPAA track
+
+Compliance work is documented step by step under [hipaa/](hipaa/):
+
+| Step | Doc | Status |
+|------|-----|--------|
+| 1 | [PHI data-flow map](hipaa/01-phi-data-flow-map.md) | done — 2026-08-21 |
+| 2 | [Security Risk Assessment](hipaa/02-security-risk-assessment.md) — risk register, safeguard gap analysis, vendor BAA table, remediation plan | done — 2026-08-21 |
+| 3 | [Technical remediation report](hipaa/03-technical-remediation-report.md) — what was changed in code, verification, what remains | done — 2026-08-21 |
+| 4 | Vendor BAAs, hosting, policies & training (administrative track) | next |

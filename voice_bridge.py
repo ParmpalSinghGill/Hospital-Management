@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from phi_redact import redact_obj, redact_text
+
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -45,6 +47,7 @@ _LC_TOOLS = {
 # browser conversation (thread_id) keeps memory across call reconnects.
 _SHARED_GRAPH = None
 _SHARED_GRAPH_PROVIDER: str | None = None
+_SHARED_GRAPH_MODEL: str | None = None
 
 
 def create_hospital_graph(*, llm_provider: str | None = None):
@@ -64,18 +67,26 @@ def create_hospital_graph(*, llm_provider: str | None = None):
 
 def get_shared_hospital_graph(*, llm_provider: str | None = None):
     """Reuse one compiled graph so InMemorySaver checkpoints survive new calls."""
-    global _SHARED_GRAPH, _SHARED_GRAPH_PROVIDER
+    global _SHARED_GRAPH, _SHARED_GRAPH_PROVIDER, _SHARED_GRAPH_MODEL
     import os
 
-    from service_settings import apply_settings_to_env, load_settings
+    from service_settings import apply_settings_to_env, llm_model_for, load_settings
 
     apply_settings_to_env()
     settings = load_settings()
     provider = llm_provider or settings.get("cascade_llm") or "deepseek"
-    if _SHARED_GRAPH is None or _SHARED_GRAPH_PROVIDER != provider:
-        logger.info(f"Building shared hospital graph (provider={provider})")
+    # Admin changes must apply live: rebuild when the provider OR its model id changes
+    # (e.g. deepseek-chat -> deepseek-v4-flash, or OpenAI switched to gpt-5.6-luna).
+    model = llm_model_for(settings, provider)
+    if (
+        _SHARED_GRAPH is None
+        or _SHARED_GRAPH_PROVIDER != provider
+        or _SHARED_GRAPH_MODEL != model
+    ):
+        logger.info(f"Building shared hospital graph (provider={provider}, model={model})")
         _SHARED_GRAPH = create_hospital_graph(llm_provider=provider)
         _SHARED_GRAPH_PROVIDER = provider
+        _SHARED_GRAPH_MODEL = model
     else:
         os.environ["LLM_PROVIDER"] = provider
         os.environ["CLI_LLM_PROVIDER"] = provider
@@ -303,7 +314,7 @@ def make_langgraph_processor(
         def _queue_while_busy(self, user_text: str) -> None:
             """Append (don't overwrite) so digit fragments aren't dropped."""
             self._pending_user_text = merge_utterances(self._pending_user_text, user_text)
-            logger.info(f"Queuing user turn while busy: {user_text!r}")
+            logger.info(f"Queuing user turn while busy ({len(user_text)} chars)")
             try:
                 from conversation_log import record_timeline_event
 
@@ -336,7 +347,7 @@ def make_langgraph_processor(
             self._phone_buffer = ""
             if not text:
                 return
-            logger.info(f"Flushing phone fragment buffer: {text!r}")
+            logger.info(f"Flushing phone fragment buffer ({len(text)} chars)")
             if self._busy:
                 self._queue_while_busy(text)
                 return
@@ -408,7 +419,7 @@ def make_langgraph_processor(
             self._last_user_at = now
             state["last_user_text"] = user_text
             state["busy"] = True
-            logger.info(f"LangGraph turn ({thread_id}): {user_text!r}")
+            logger.info(f"LangGraph turn ({thread_id}): {len(user_text)} chars")
             # Run inference off the process-frame task. If we await here inside
             # process_frame and swallow CancelledError, Pipecat's barge-in waits
             # forever for the process task to exit → dead silence.
@@ -474,7 +485,7 @@ def make_langgraph_processor(
                     user_text == self._last_user_text
                     and (now - self._last_user_at) < 2.0
                 ):
-                    logger.debug(f"Skipping duplicate LangGraph turn: {user_text!r}")
+                    logger.debug("Skipping duplicate LangGraph turn")
                     return
 
                 awaiting = bot_awaiting_phone(str(state.get("last_bot_text") or ""))
@@ -490,7 +501,7 @@ def make_langgraph_processor(
                     self._cancel_phone_flush()
                     user_text = merge_utterances(self._phone_buffer, user_text)
                     self._phone_buffer = ""
-                    logger.info(f"Flushing phone buffer with follow-up: {user_text!r}")
+                    logger.info(f"Flushing phone buffer with follow-up ({len(user_text)} chars)")
 
                 if self._busy:
                     self._queue_while_busy(user_text)
@@ -629,7 +640,7 @@ def register_hospital_tools_on_llm(llm) -> list:
             import time
 
             args = dict(params.arguments or {})
-            logger.info(f"Realtime tool {_name} args={args}")
+            logger.info(f"Realtime tool {_name} args={redact_obj(args)}")
             t0 = time.perf_counter()
             error = ""
             data: Any = None

@@ -27,6 +27,8 @@ const avgVoiceEl = document.getElementById("avg-voice-value");
 const composerForm = document.getElementById("composer-form");
 const textInput = document.getElementById("text-input");
 const micButton = document.getElementById("mic-button");
+const micMasterBtn = document.getElementById("mic-master-btn");
+const micMasterLabel = document.getElementById("mic-master-label");
 const micButtonLabel = document.getElementById("mic-button-label");
 
 const callDock = document.getElementById("call-dock");
@@ -44,6 +46,9 @@ let connected = false;
 let connecting = false;
 let voiceCallActive = false;
 let micMuted = false;
+// Master mic switch — OFF on every page load. While off, NOTHING (including an
+// active call) may stream mic audio; this is the guard against phantom STT turns.
+let micAllowed = false;
 let assistantEl = null;
 let assistantWrap = null;
 let lastAssistantEl = null;
@@ -130,9 +135,15 @@ async function startNewPatientSession() {
     clearTranscript();
     const ids = resetSessionIdentity();
     callId = null;
+    // Re-read the Admin backend selection (provider + model) for the fresh session.
+    if (backendLabel) backendLabel.textContent = "Refreshing…";
+    const cfg = await loadUiConfig();
+    const backend = cfg ? formatBackendLabel(cfg) : "";
     addMessage(
       "system",
-      `New patient session ready (${ids.threadId}). Say hello and register with a phone number.`
+      `New patient session ready (${ids.threadId}).` +
+        (backend ? ` Backend: ${backend}.` : "") +
+        " Say hello and register with a phone number."
     );
     if (welcomeStrip) welcomeStrip.hidden = true;
     showBanner("Started a new patient session — previous chat memory cleared.");
@@ -171,14 +182,22 @@ function newCallId() {
   return `sess_${stamp}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
+let callToken = null; // issued by /api/call-logs/start; required for event/end
+
 async function postCallLog(path, payload) {
   try {
-    await fetch(`/api/call-logs/${path}`, {
+    const body = { ...payload };
+    if (path !== "start" && callToken) body.call_token = callToken;
+    const res = await fetch(`/api/call-logs/${path}`, {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
+    if (path === "start" && res.ok) {
+      const data = await res.json().catch(() => ({}));
+      if (data && data.call_token) callToken = data.call_token;
+    }
   } catch (err) {
     console.warn("call log failed", path, err);
   }
@@ -207,6 +226,7 @@ async function endCallLog() {
   const id = callId;
   callId = null;
   await postCallLog("end", { call_id: id });
+  callToken = null;
 }
 
 function logClientEvent(type, extra = {}) {
@@ -366,6 +386,11 @@ function beginTurnTiming(mode) {
   userTurnPending = true;
   // Allow the next bot reply even if it matches the previous wording.
   lastShownBotText = "";
+  // Close the previous bot bubble: a reply cut off mid-stream (barge-in) must
+  // never have the NEXT turn's text appended to it without a boundary.
+  assistantEl = null;
+  assistantWrap = null;
+  botTextSource = null;
 }
 
 function addMessage(role, text, { sentAt = null } = {}) {
@@ -604,7 +629,7 @@ async function openCallDock() {
   voiceMicIndicator.classList.remove("active");
   voiceMicFeedback.textContent = "Waiting for your voice…";
   setOrbState("listening");
-  setVoiceStatus("Listening…");
+  setVoiceStatus(micAllowed ? "Listening…" : "Mic off — use the Mic button (top right) to speak");
   voiceCaption.textContent = "";
   callDock.hidden = false;
   setBotAudioMuted(false);
@@ -631,6 +656,9 @@ function closeCallDock() {
   callDock.hidden = true;
   micButtonLabel.textContent = "Call";
   setBotAudioMuted(true);
+  // Defense in depth: EVERY path that closes the dock must silence the mic —
+  // a hot mic during text chat injects phantom STT turns into the conversation.
+  killMicTrack().catch((err) => console.warn("killMicTrack failed", err));
   // Do NOT endCallLog here — WebRTC often stays up for text chat. Ending the
   // log and minting a new call_id on the next mic open split client vs server
   // sessions (voice-start-only on one file, chat turns on another).
@@ -686,7 +714,32 @@ function resolvePreferredMicId(mics, preferred = preferredMicId) {
   return (systemDefault || list[0]).deviceId;
 }
 
+async function killMicTrack() {
+  // Physical gate: stop the capture track and detach it from the WebRTC sender,
+  // so no audio can flow regardless of SDK enable/mute state.
+  try {
+    await client?.enableMic(false);
+  } catch (err) {
+    console.warn("enableMic(false) failed", err);
+  }
+  try {
+    const track = getLocalAudioTrack();
+    if (track) track.stop();
+    const transport = client?._transport;
+    const sender =
+      transport?.getAudioTransceiver?.()?.sender ??
+      transport?.pc?.getTransceivers?.()?.[0]?.sender;
+    if (sender) await sender.replaceTrack(null);
+  } catch (err) {
+    console.warn("killMicTrack failed", err);
+  }
+}
+
 async function startVoiceCapture() {
+  if (!micAllowed) {
+    await killMicTrack();
+    return;
+  }
   await refreshMicList({ requestPermission: true });
 
   // Drop a stuck localStorage preference for Chromium's broken virtual "default".
@@ -716,13 +769,13 @@ async function startVoiceCapture() {
   } catch (err) {
     console.warn("mic warm-up failed", err);
   }
-  await client.enableMic(true);
+  await client.enableMic(micAllowed);
   await new Promise((r) => setTimeout(r, 80));
 
   if (micId && !isVirtualMicId(micId)) {
     try {
       await client.updateMic(micId);
-      if (!micMuted) await client.enableMic(true);
+      if (!micMuted && micAllowed) await client.enableMic(true);
     } catch (err) {
       console.warn("hardware mic apply failed, staying on browser default stream", err);
     }
@@ -730,7 +783,7 @@ async function startVoiceCapture() {
 
   const track = getLocalAudioTrack();
   if (track) {
-    track.enabled = !micMuted;
+    track.enabled = !micMuted && micAllowed;
     await replaceLocalAudioTrack(track);
   }
 }
@@ -813,7 +866,7 @@ async function applyMicSelection(deviceId = preferredMicId) {
       select.value = preferredMicId;
     }
   }
-  if (!client || !voiceCallActive) return;
+  if (!client || !voiceCallActive || !micAllowed) return;
   try {
     // Same warm-up + switch pattern as call start.
     await client.updateMic("");
@@ -822,7 +875,7 @@ async function applyMicSelection(deviceId = preferredMicId) {
     if (preferredMicId && !isVirtualMicId(preferredMicId)) {
       await client.updateMic(preferredMicId);
     }
-    if (!micMuted) {
+    if (!micMuted && micAllowed) {
       await client.enableMic(true);
       const track = getLocalAudioTrack();
       if (track) {
@@ -1107,6 +1160,36 @@ composerForm.addEventListener("submit", async (event) => {
   }
 });
 
+function updateMicMasterUi() {
+  if (!micMasterBtn) return;
+  micMasterBtn.classList.toggle("on", micAllowed);
+  micMasterBtn.setAttribute("aria-pressed", micAllowed ? "true" : "false");
+  micMasterBtn.title = micAllowed
+    ? "Microphone is enabled — click to disable it"
+    : "Microphone is disabled by default — click to enable it";
+  if (micMasterLabel) micMasterLabel.textContent = micAllowed ? "Mic on" : "Mic off";
+}
+
+micMasterBtn?.addEventListener("click", async () => {
+  micAllowed = !micAllowed;
+  updateMicMasterUi();
+  if (!client) return; // takes effect on the next connect
+  try {
+    if (micAllowed && voiceCallActive) {
+      await refreshMicList({ requestPermission: true });
+      await startVoiceCapture();
+      setVoiceStatus("Listening…");
+    } else if (!micAllowed) {
+      await killMicTrack();
+      if (voiceCallActive) setVoiceStatus("Mic off — use the Mic button (top right) to speak");
+    }
+  } catch (err) {
+    console.warn("mic master toggle failed", err);
+  }
+});
+
+updateMicMasterUi();
+
 micButton.addEventListener("click", async () => {
   if (voiceCallActive) {
     client?.enableMic(false)?.catch((err) => console.warn("enableMic(false) failed", err));
@@ -1140,7 +1223,7 @@ voiceClose.addEventListener("click", () => {
 
 voiceMute.addEventListener("click", () => {
   micMuted = !micMuted;
-  client?.enableMic(!micMuted)?.catch((err) => console.warn("enableMic toggle failed", err));
+  client?.enableMic(!micMuted && micAllowed)?.catch((err) => console.warn("enableMic toggle failed", err));
   voiceMute.classList.toggle("muted", micMuted);
   voiceMute.textContent = micMuted ? "Unmute" : "Mute";
   updateMicVisual(micMuted ? 0 : localMicLevel);
@@ -1161,7 +1244,8 @@ function formatBackendLabel(cfg) {
   if (pipeline === "realtime") {
     return "Realtime · OpenAI";
   }
-  const llm = (cfg.cascade_llm || "deepseek").toUpperCase();
+  const llmId = (cfg.cascade_llm || "deepseek").toUpperCase();
+  const llm = cfg.cascade_llm_model ? `${llmId} (${cfg.cascade_llm_model})` : llmId;
   const stt = cfg.stt || "deepgram";
   const tts = cfg.tts || "deepgram";
   return `Cascade · ${stt} / ${llm} / ${tts}`;
@@ -1169,8 +1253,11 @@ function formatBackendLabel(cfg) {
 
 async function loadUiConfig() {
   try {
-    const res = await fetch("/admin/api/ui-config", { credentials: "same-origin" });
-    if (!res.ok) return;
+    const res = await fetch("/admin/api/ui-config", {
+      credentials: "same-origin",
+      cache: "no-store", // always read the live Admin choice, never a cached copy
+    });
+    if (!res.ok) return null;
     const data = await res.json();
     debugMode = Boolean(data.debug_mode);
     const realtimeOk = data.enabled_realtime !== false;
@@ -1178,9 +1265,11 @@ async function loadUiConfig() {
       data.voice_pipeline_default === "realtime" && realtimeOk ? "realtime" : "cascade";
     if (backendLabel) backendLabel.textContent = formatBackendLabel(data);
     updateAvgResponse();
+    return data;
   } catch (err) {
     console.warn("ui-config fetch failed", err);
     if (backendLabel) backendLabel.textContent = "Cascade (default)";
+    return null;
   }
 }
 

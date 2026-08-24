@@ -2,7 +2,24 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _dev_mode_unless_opted_in(monkeypatch, tmp_path):
+    """Legacy tests exercise dev behaviour (all providers); tests/test_security.py opts into
+    HIPAA_MODE=1 through its own fixture, which runs after this one."""
+    monkeypatch.setenv("HIPAA_MODE", os.getenv("PYTEST_HIPAA_MODE", "0"))
+    monkeypatch.delenv("SYNTHETIC_DATA_ONLY", raising=False)
+    import security_config as sc
+
+    sc._SECRET_CACHE = None
+    # Never write test audit records into the repo's real audit/ directory.
+    if not os.getenv("DATA_DIR"):
+        monkeypatch.setattr(sc, "audit_dir", lambda: tmp_path / "audit")
+    yield
 
 
 @pytest.fixture

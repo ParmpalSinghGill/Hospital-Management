@@ -124,15 +124,17 @@ Copy `.env.example` → `.env`. Never commit `.env`.
 | `GLM_MODEL` | GLM chat model | Default `glm-4-flash` |
 | `GLM_BASE_URL` | GLM API | Default China endpoint; use Z.ai URL if needed |
 | `DEEPSEEK_API_KEY` | Cascade LLM (default) | Required for default Cascade |
-| `DEEPSEEK_MODEL` | DeepSeek chat model | Default `deepseek-chat` |
+| `DEEPSEEK_MODEL` | DeepSeek chat model | Default `deepseek-v4-flash` (V4 thinking off; `DEEPSEEK_THINKING=1` to enable) |
 | `DEEPSEEK_BASE_URL` | DeepSeek API | Default `https://api.deepseek.com` |
 | `OPENAI_API_KEY` | Realtime (+ optional chat LLM) | Required for Realtime |
 | `OPENAI_REALTIME_MODEL` | Realtime | Default `gpt-realtime` |
 | `OPENAI_REALTIME_VOICE` | Realtime | Default `marin` |
-| `OPENAI_CHAT_MODEL` | Optional OpenAI chat LLM | Default `gpt-4o-mini` |
+| `OPENAI_CHAT_MODEL` | Optional OpenAI chat LLM | Default `gpt-5.6-luna` (`OPENAI_REASONING_EFFORT`, default `none`) |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Langfuse tracing of every turn (router → agent → LLM → tools) | Optional; tracing is off unless both are set |
+| `LANGFUSE_BASE_URL` | Langfuse server | Default self-hosted `http://localhost:53110`; use a **dedicated Langfuse org/project per app** (keys are project-scoped, so data never mixes with other apps on the same server); `LANGFUSE_TRACING_ENABLED=0` pauses, `LANGFUSE_MASK_PHI` (default on in HIPAA mode) masks phones/emails in all trace text and names in structured tool fields (not names inside free-text prompts); `RETAIN_LANGFUSE_DAYS` (default 1) — the daily retention job deletes our traces older than this via the Langfuse API |
 | `LLM_PROVIDER` | LangGraph agents | `glm` / `groq` / `openai` / `deepseek` (overridden by Admin) |
 | `BOT_MODE` | Voice default | `cascade` or `realtime` |
-| `ADMIN_USER` / `ADMIN_PASS` | Admin login | Defaults `Admin` / `12345` |
+| `ADMIN_USER` / `ADMIN_PASS_HASH` | Admin login | No defaults. Prefer `python manage_admin.py add <user>` (hashed accounts + roles); weak passwords are refused in HIPAA mode |
 | `DAILY_API_KEY` | Optional | Daily transport for production |
 | `TELEGRAM_BOT_TOKEN` | [Telegram](MD/telegram.md) | From [@BotFather](https://t.me/BotFather) |
 | `DISCORD_BOT_TOKEN` | [Discord](MD/discord.md) | From [Developer Portal](https://discord.com/developers/applications) |
@@ -146,7 +148,7 @@ Admin settings also persist to `admin_settings.json` (gitignored).
 
 | Mode | STT | LLM | TTS | Flow |
 |------|-----|-----|-----|------|
-| **Cascade** (default) | Deepgram | DeepSeek `deepseek-chat`* | Deepgram Aura | speech → text → agent → speech |
+| **Cascade** (default) | Deepgram | DeepSeek `deepseek-v4-flash`* | Deepgram Aura | speech → text → agent → speech |
 | **Realtime** | OpenAI Realtime | `gpt-realtime`* | OpenAI voice | speech ↔ speech |
 
 \*Configurable in [Admin](MD/admin.md). Cascade runs the same LangGraph graph as CLI; Realtime registers the same `Tools.py` functions on the OpenAI session.
@@ -236,3 +238,28 @@ List recent sessions: `GET /api/call-logs/recent` (when `bot.py` is running).
 
 Voice UI patterns adapted from Pipecat-style WebRTC clients.  
 Hospital agent logic and appointment tools are project-specific.
+
+## Security / HIPAA
+
+The assistant runs in **HIPAA mode by default** (`HIPAA_MODE=1`): PHI may only go to
+BAA-capable vendors (`PHI_ALLOWED_PROVIDERS`, default `openai`), Telegram/Discord become
+non-PHI hand-off channels, raw LLM dumps are disabled, admin sessions use hashed accounts
+with roles/lockout/secure cookies, all PHI endpoints require auth, tool calls and admin
+reads are written to a tamper-evident audit log, retention purges run daily, and encrypted
+backups are taken daily. Put every PHI store on an encrypted volume via `DATA_DIR`.
+
+**Developing with synthetic data** (the normal state of this repo): keep `HIPAA_MODE=1` and set
+`SYNTHETIC_DATA_ONLY=1` — every control stays on, but DeepSeek/GLM/Telegram/Discord may be used
+because no real patient exists. Before the first real record: remove that flag, set
+`PHI_ALLOWED_PROVIDERS=openai` (after the BAA), and run **`python go_live_check.py`** — it refuses
+to pass while any non-BAA vendor, key, or channel is still live. `HIPAA_MODE=0` disables the
+controls entirely and is only for throw-away local experiments.
+
+| Task | Command |
+|---|---|
+| Create an admin account | `python manage_admin.py add ops` |
+| Retention purge (dry-run) | `python retention.py --dry-run` |
+| Encrypted backup / verify / restore | `python backup.py keygen` → `BACKUP_ENC_KEY=… python backup.py create` |
+| Go-live preflight | `python go_live_check.py` |
+| Verify audit chain | `python -c "import audit_log;print(audit_log.verify_chain())"` |
+| Security docs | [MD/hipaa/](MD/hipaa/) — data-flow map, risk assessment, remediation report |

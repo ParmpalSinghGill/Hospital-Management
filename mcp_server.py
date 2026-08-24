@@ -15,13 +15,10 @@ Run::
     python mcp_server.py --transport streamable-http --port 8000
     python mcp_server.py --transport sse --port 8000
 
-Cloudflare Tunnel example::
-
-    cloudflared tunnel --url http://127.0.0.1:8000
-
-Then in ChatGPT Developer mode, add the public URL:
-  Streamable HTTP → https://<tunnel>/mcp
-  SSE             → https://<tunnel>/sse
+Remote access: HTTP/SSE transports **require** ``MCP_API_KEY`` (clients send
+``Authorization: Bearer <key>``). Publish only through a host/tunnel that is
+covered by a BAA (see MD/mcp-cloudflare.md); never a quick trycloudflare URL
+with real patient data.
 """
 
 from __future__ import annotations
@@ -48,7 +45,8 @@ if str(_ROOT) not in sys.path:
 
 load_dotenv(_ROOT / ".env", override=True)
 
-from mcp_demo_oauth import DemoOAuthProvider  # noqa: E402
+import security_config as sc  # noqa: E402
+from audit_log import audit  # noqa: E402
 from tool_catalog import ALL_TOOLS, build_tool_catalog  # noqa: E402
 
 
@@ -133,14 +131,14 @@ def _browser_home_html(*, public_url: str | None = None, oauth: bool = False) ->
         name = tool.name
         desc = (tool.description or "").strip().split("\n", 1)[0]
         rows.append(f"<tr><td><code>{name}</code></td><td>{desc}</td></tr>")
-    base = (public_url or "").rstrip("/") or "https://YOUR_TUNNEL.trycloudflare.com"
+    base = (public_url or "").rstrip("/") or "https://YOUR-HOST.example.com"
     auth_note = (
-        "<p><strong>OAuth demo is ON</strong> — ChatGPT can register via DCR. "
-        "Approve the redirect if asked.</p>"
+        "<p><strong>Demo OAuth is ON (dev only)</strong>.</p>"
         if oauth
-        else "<p><strong>OAuth is OFF</strong> — in ChatGPT choose "
-        "<b>No Authentication</b>. If ChatGPT still errors on sign-in, restart with "
-        "<code>--oauth --public-url …</code>.</p>"
+        else "<p><strong>Bearer auth</strong> — clients must send "
+        "<code>Authorization: Bearer &lt;MCP_API_KEY&gt;</code>. "
+        "Publish only through a BAA-covered host; never expose real patient data via a "
+        "quick tunnel.</p>"
     )
     return f"""<!doctype html>
 <html lang="en"><head>
@@ -179,6 +177,13 @@ def build_mcp(
     """Create FastMCP app with all hospital tools registered once."""
     auth_kwargs: dict[str, Any] = {}
     if enable_oauth:
+        if sc.hipaa_mode():
+            raise SystemExit(
+                "The demo OAuth provider auto-approves every client and is refused while "
+                "HIPAA_MODE is on. Use MCP_API_KEY bearer auth (default) or integrate a real IdP."
+            )
+        from mcp_demo_oauth import DemoOAuthProvider  # local/dev only
+
         base = (public_url or "").rstrip("/")
         if not base.startswith("https://"):
             raise SystemExit(
@@ -241,21 +246,6 @@ def build_mcp(
             }
         )
 
-    @mcp.custom_route("/tool-calls", methods=["GET"])
-    async def tool_calls_tail(_request: Request) -> Response:
-        """Recent tool-call audit from chats/tool_call.json."""
-        from conversation_log import list_tool_calls
-
-        limit = 50
-        try:
-            raw = int(_request.query_params.get("limit") or "50")
-            limit = max(1, min(raw, 500))
-        except ValueError:
-            pass
-        source = str(_request.query_params.get("source") or "").strip()
-        rows = list_tool_calls(limit=limit, source=source)
-        return JSONResponse({"ok": True, "count": len(rows), "tool_calls": rows})
-
     return mcp
 
 
@@ -288,8 +278,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-tunnel",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Allow Cloudflare/public Host headers (default: on for HTTP/SSE).",
+        default=os.getenv("MCP_ALLOW_TUNNEL", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Disable the DNS-rebinding Host guard for public tunnels (default: off). "
+            "Prefer MCP_ALLOWED_HOSTS=<your-host> instead."
+        ),
     )
     parser.add_argument(
         "--public-url",
@@ -300,7 +293,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--oauth",
         action=argparse.BooleanOptionalAction,
         default=os.getenv("MCP_OAUTH", "").lower() in ("1", "true", "yes"),
-        help="Enable demo OAuth + DCR for ChatGPT (needs --public-url).",
+        help="Enable the DEMO OAuth provider (dev only; refused in HIPAA_MODE).",
     )
     return parser.parse_args(argv)
 
@@ -327,6 +320,13 @@ def main(argv: list[str] | None = None) -> None:
         mcp.run(transport="stdio")
         return
 
+    api_key = sc.mcp_api_key()
+    if not api_key and not args.oauth:
+        raise SystemExit(
+            "HTTP/SSE MCP transports require authentication. Set MCP_API_KEY=<long random "
+            "secret> (clients send 'Authorization: Bearer <key>'), or run --transport stdio."
+        )
+
     endpoint = (
         f"http://{args.host}:{args.port}/mcp"
         if args.transport == "streamable-http"
@@ -337,11 +337,59 @@ def main(argv: list[str] | None = None) -> None:
         f"Hospital MCP server ({args.transport}) on {endpoint}\n"
         f"Browser page: {pub}/\n"
         f"ChatGPT URL:  {pub}/mcp\n"
-        f"OAuth: {'ON (demo DCR)' if args.oauth else 'OFF — use No Authentication in ChatGPT'}\n"
+        f"Auth: {'demo OAuth (dev only)' if args.oauth else 'Bearer MCP_API_KEY required'}\n"
         f"Tools: {', '.join(t.name for t in ALL_TOOLS)}",
         file=sys.stderr,
     )
-    mcp.run(transport=args.transport)
+    _serve_http(mcp, args, api_key=api_key)
+
+
+class _BearerAuthMiddleware:
+    """Require ``Authorization: Bearer <MCP_API_KEY>`` on every request except /health."""
+
+    def __init__(self, app: Any, api_key: str) -> None:
+        self.app = app
+        self.api_key = api_key
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        stype = scope.get("type")
+        # "lifespan" = uvicorn's internal startup/shutdown events, not a network request.
+        if stype == "lifespan" or not self.api_key:
+            await self.app(scope, receive, send)
+            return
+        if stype == "websocket":
+            # No websocket routes exist today; refuse rather than trust that stays true.
+            audit("mcp.auth", actor="anonymous", outcome="deny", detail={"path": "ws"})
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        path = scope.get("path") or ""
+        if path in ("/health",):
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers") or []}
+        auth = headers.get("authorization", "")
+        ok = auth.startswith("Bearer ") and _ct_eq(auth[7:].strip(), self.api_key)
+        if not ok:
+            audit("mcp.auth", actor="anonymous", outcome="deny", detail={"path": path[:80]})
+            resp = JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer"})
+            await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+def _ct_eq(a: str, b: str) -> bool:
+    import hmac
+
+    return hmac.compare_digest(a.encode(), b.encode())
+
+
+def _serve_http(mcp: FastMCP, args: argparse.Namespace, *, api_key: str) -> None:
+    import uvicorn
+
+    app = mcp.streamable_http_app() if args.transport == "streamable-http" else mcp.sse_app()
+    wrapped: Any = _BearerAuthMiddleware(app, api_key) if api_key else app
+    uvicorn.run(wrapped, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

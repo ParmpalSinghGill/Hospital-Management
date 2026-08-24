@@ -38,6 +38,15 @@ def _truncate_tool_payload(value: Any, *, limit: int = 4000) -> Any:
             return text
     return text[: limit - 1] + "…"
 
+def _maybe_json(text: Any) -> Any:
+    if isinstance(text, str):
+        try:
+            return json.loads(text)
+        except (ValueError, TypeError):
+            return text
+    return text
+
+
 def record_tool_call(
     *,
     tool: str,
@@ -63,6 +72,16 @@ def record_tool_call(
 
     cid = (call_id or get_current_call_id() or "").strip()
     args = arguments if isinstance(arguments, dict) else {}
+    try:
+        from security_config import hipaa_mode as _hm
+
+        if _hm():
+            from phi_redact import redact_obj
+
+            args = redact_obj(args)
+            result = redact_obj(result) if not isinstance(result, str) else redact_obj(_maybe_json(result))
+    except Exception:  # noqa: BLE001
+        pass
     entry: dict[str, Any] = {
         "at": _utc_iso(),
         "type": "tool_call",

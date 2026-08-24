@@ -69,7 +69,10 @@ def test_full_patient_journey_book_reschedule_cancel(isolated_db):
     )
     assert blocked["ok"] is False
 
-    moved = _j(reschedule_appointment, appointment_id=aid, new_time="2026-12-15 11:30")
+    # Ownership proof: phone must belong to the appointment
+    foreign = _j(reschedule_appointment, appointment_id=aid, new_time="2026-12-15 11:30", phone="9822222222")
+    assert foreign["ok"] is False and foreign.get("not_owner") is True
+    moved = _j(reschedule_appointment, appointment_id=aid, new_time="2026-12-15 11:30", phone=phone)
     assert moved["ok"] is True
     assert moved["appointment"]["time"] == "2026-12-15 11:30"
 
@@ -77,7 +80,10 @@ def test_full_patient_journey_book_reschedule_cancel(isolated_db):
     again = _j(lookup_patient, phone=phone, patient_name=name)
     assert again["active_appointment"]["appointment_id"] == aid
 
-    cancelled = _j(cancel_appointment, phone=phone)
+    # Phone alone is not enough to cancel; phone + full name is
+    half = _j(cancel_appointment, phone=phone)
+    assert half["ok"] is False and half.get("needs_name") is True
+    cancelled = _j(cancel_appointment, phone=phone, patient_name=name)
     assert cancelled["ok"] is True
     assert cancelled["appointment"]["status"] == "CANCELLED"
 

@@ -1,6 +1,8 @@
 """Appointments, conflicts, availability, and booking guidance."""
 from __future__ import annotations
 
+import random
+
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +25,9 @@ from db_doctors import (
 )
 from db_patients import _get_patient_by_id
 from db_time import (
+    is_after_preference,
+    normalize_time_window,
+    time_window_from_text,
     _iter_clinic_slots_on_day,
     classify_appointment_timing,
     is_within_clinic_hours,
@@ -275,10 +280,14 @@ def find_nearest_available_times(
     slot_minutes: int = _DEFAULT_SLOT_MINUTES,
     search_days: int = 3,
     now: Optional[datetime] = None,
+    time_window: Optional[str] = None,
 ) -> List[str]:
     """Nearest free slots for this doctor around the requested time (same clinic hours).
 
-    Accepts day-only phrases like 'today' / 'tomorrow' (searches remaining slots that day first).
+    Accepts day-only phrases like 'today' / 'tomorrow' (searches remaining slots that day
+    first). ``time_window``: 'after' → only slots at/after the anchor; 'before' → only
+    slots strictly before it; None → nearest around (a textual 'after 2pm'/'before 2pm'
+    in *preferred_time* implies the window when the argument is not given).
     """
     now = now or datetime.now()
     preferred, day_only = parse_availability_anchor(preferred_time, now=now)
@@ -292,17 +301,23 @@ def find_nearest_available_times(
         doc_id, exclude_appointment_id=exclude_appointment_id
     )
     preferred_key = preferred.strftime("%Y-%m-%d %H:%M")
+    window = normalize_time_window(time_window) or time_window_from_text(preferred_time)
     candidates: List[Tuple[timedelta, datetime]] = []
     for day_offset in range(0, max(1, int(search_days))):
         day = preferred.date() + timedelta(days=day_offset)
         for slot in _iter_clinic_slots_on_day(day, slot_minutes=slot_minutes):
             if slot <= now:
                 continue
+            if window == "after" and slot < preferred:
+                continue  # 'after 12pm' must never offer a morning slot
+            if window == "before" and slot >= preferred:
+                continue  # 'before 2pm' means strictly earlier than 2pm
             key = slot.strftime("%Y-%m-%d %H:%M")
             if key in taken:
                 continue
-            # Exact clock requests skip the conflicted preferred slot; day-only includes it.
-            if not day_only and key == preferred_key:
+            # Exact clock requests skip the conflicted preferred slot; day-only and
+            # windowed requests keep the anchor as a legitimate candidate.
+            if not day_only and window is None and key == preferred_key:
                 continue
             if is_doctor_unavailable(doc_id, key):
                 continue
@@ -399,6 +414,8 @@ def _appointment_counts_for_day(day_prefix: str) -> Dict[str, int]:
 def rank_doctors_for_preferred_time(
     doctors: List[Dict[str, Any]],
     preferred_time: str,
+    *,
+    time_window: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Rank doctors: free at preferred time first, then fewer appointments that day.
 
@@ -412,23 +429,30 @@ def rank_doctors_for_preferred_time(
 
     day_prefix = (req[:10] if req else day.isoformat())
     day_loads = _appointment_counts_for_day(day_prefix)
+    window = (normalize_time_window(time_window) or time_window_from_text(preferred_time)) if req else None
+    # Windowed requests ('after 2pm') are flexible like day-only ones: a doctor is a
+    # match when ANY slot inside the window is free, not only the anchor slot.
     day_only = req is None
+    flexible = day_only or window is not None
     ranked: List[Dict[str, Any]] = []
     for d in doctors:
         did = str(d.get("doctor_id") or "").strip().upper()
         row = dict(d)
         row["day_appointment_count"] = int(day_loads.get(did, 0))
         row["day"] = day_prefix
-        if day_only:
+        if flexible:
             nearest = find_nearest_available_times(
                 did,
                 preferred_time,
                 limit=3,
                 search_days=1,
+                time_window=window,
             )
             row["free_at_preferred_time"] = bool(nearest)
             row["nearest_times"] = nearest
-            row["day_only_preference"] = True
+            row["day_only_preference"] = day_only
+            if window:
+                row["time_window"] = window
         else:
             conflict = _find_conflict(
                 None,
@@ -444,11 +468,13 @@ def rank_doctors_for_preferred_time(
             row["free_at_preferred_time"] = free_now
             row["day_only_preference"] = False
         ranked.append(row)
+    # Same availability + same load → random order, so one doctor is not always
+    # picked first alphabetically; lighter-loaded doctors still come first.
+    random.shuffle(ranked)
     ranked.sort(
         key=lambda row: (
             0 if row.get("free_at_preferred_time") else 1,
             int(row.get("day_appointment_count") or 0),
-            str(row.get("name") or "").lower(),
         )
     )
     return ranked
@@ -623,7 +649,11 @@ def build_department_booking_guidance(
             "requested_department": req_dep,
             "message": (
                 f"No active appointment for {req_dep}. "
-                f"Ask: would you like to book a {req_dep} appointment?"
+                "If the caller already asked to book or agreed to this department, do NOT "
+                "ask again whether they want to book — go straight to the next step: ask "
+                "their preferred day/time, then list_doctors. Only when booking intent is "
+                f"still unclear ask: would you like to book a {req_dep} appointment? "
+                "If they add context or correct the department, use the new one instead."
             ),
         }
 

@@ -43,3 +43,16 @@ The Admin home can show API credit / connectivity probes for configured provider
 
 - Change the default password before any shared deployment
 - Telegram / Discord / MCP do not require Admin to start, but they share the same DB and (for LangGraph text) LLM provider settings where applicable
+
+## Accounts & security (HIPAA)
+
+* There are **no default credentials**. Create accounts with
+  `python manage_admin.py add <username> [--role admin|viewer]` (passwords are scrypt-hashed in
+  `admin_users.json`, 0600). `viewer` can read; only `admin` can change settings/doctors or delete.
+* Sessions expire after 30 min idle / 12 h absolute, are revoked on logout, and are locked for
+  15 min after 5 failed logins. Cookies are `Secure` + `HttpOnly` + `SameSite=Strict`
+  (set `COOKIE_SECURE=0` only for plain-HTTP local dev).
+* Every PHI read (patients, chats, appointments, LLM dumps) and every change is recorded in
+  the audit log — see `GET /admin/api/audit` (admin role).
+* "Save LLM messages" cannot be enabled while `HIPAA_MODE=1`; providers without a BAA
+  (DeepSeek, GLM) show as *blocked* and cannot be selected.

@@ -57,3 +57,13 @@ GraphApi.py
 FuctionalApi.py
 *.bak
 *.tmp
+
+# --- HIPAA: PHI stores, secrets, backups (never commit) ---
+Records
+admin_users.json
+audit/
+backups/
+data/
+dataset/*.db*
+*.enc
+Info

@@ -256,34 +256,43 @@ def _resolve_patient(
                 "is_new": True,
             }
         if name and not _names_match(name, str(patient.get("name", ""))):
+            # Do NOT reveal the on-file name: the caller must know it.
             return {
                 "ok": False,
-                "patient": patient,
+                "patient": None,
                 "message": (
-                    f"Phone matches patient {patient.get('patient_id')} "
-                    f"({patient.get('name')}), but the name given ({name}) does not match. "
-                    "Please confirm the correct name."
+                    "The name given does not match our record for this phone number. "
+                    "Ask the caller to repeat their full name as registered (do not suggest names)."
                 ),
                 "verified": False,
                 "name_mismatch": True,
                 "is_returning": True,
+                "needs_name": True,
             }
-        verified = bool(name) or not require_name_with_phone
+        if not name:
+            # Phone alone is not identity: ask for the full name before returning the record.
+            return {
+                "ok": True,
+                "patient": None,
+                "message": (
+                    "A patient is registered with this phone. Ask for their full name "
+                    "to verify before sharing or changing anything."
+                ),
+                "verified": False,
+                "name_mismatch": False,
+                "is_returning": True,
+                "is_new": False,
+                "needs_name": True,
+            }
         return {
             "ok": True,
             "patient": patient,
-            "message": (
-                f"Existing patient found by phone: {patient.get('name')} "
-                f"({patient.get('patient_id')}). "
-                "Confirm this name aloud and get a yes before continuing."
-            ),
-            "verified": verified,
+            "message": f"Patient verified: {patient.get('patient_id')}.",
+            "verified": True,
             "name_mismatch": False,
             "is_returning": True,
             "is_new": False,
-            "needs_name": not bool(name),
-            "confirm_name_from_db": patient.get("name"),
-            "confirm_phone_from_db": patient.get("phone"),
+            "needs_name": False,
         }
 
     if name and not require_name_with_phone:
@@ -301,21 +310,17 @@ def _resolve_patient(
                 "needs_phone": True,
             }
         if len(matches) == 1:
-            only = matches[0]
             return {
                 "ok": False,
-                "patient": only,
+                "patient": None,
                 "message": (
-                    f"A patient named {only.get('name')} is on file with phone "
-                    f"{only.get('phone')}. Names can be shared — ask them to confirm "
-                    f"that phone number (or give their phone), then look up by phone."
+                    "Names can be shared — ask for the phone number, then look up by phone "
+                    "with the name to verify."
                 ),
                 "verified": False,
                 "name_mismatch": False,
                 "is_returning": True,
                 "needs_phone": True,
-                "confirm_phone_from_db": only.get("phone"),
-                "confirm_name_from_db": only.get("name"),
             }
         return {
             "ok": False,

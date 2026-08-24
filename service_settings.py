@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+import security_config as sc
+
 _ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = _ROOT / "admin_settings.json"
 
@@ -20,7 +22,7 @@ PROVIDER_LABELS: dict[str, str] = {
     "deepseek": "DeepSeek",
     "glm": "Zhipu GLM",
     "groq": "Groq",
-    "openai": "OpenAI Chat (costly)",
+    "openai": "OpenAI Chat",
     "realtime": "OpenAI Realtime (costly)",
 }
 
@@ -33,7 +35,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "deepgram_voice": "aura-2-thalia-en",
     "glm_model": "glm-4-flash",
     "groq_model": "llama-3.3-70b-versatile",
-    "deepseek_model": "deepseek-chat",
+    "deepseek_model": "deepseek-v4-flash",
+    "openai_chat_model": "gpt-5.6-luna",
     "openai_realtime_model": "gpt-realtime",
     "openai_realtime_voice": "marin",
     "debug_mode": False,
@@ -84,14 +87,31 @@ def apply_enabled_map(data: dict[str, Any], enabled: dict[str, bool]) -> dict[st
 
 
 def is_provider_enabled(settings: dict[str, Any] | None, provider_id: str) -> bool:
+    """Enabled by the admin AND permitted to receive PHI (HIPAA allow-list)."""
+    if provider_id in LLM_PROVIDER_IDS and not sc.provider_allowed(provider_id):
+        return False
+    if provider_id == "realtime" and not sc.provider_allowed("openai"):
+        return False
     return bool(enabled_providers_map(settings).get(provider_id, True))
 
 
+def provider_blocked_reason(provider_id: str) -> str:
+    """Non-empty when the HIPAA allow-list (not the admin toggle) blocks this provider."""
+    pid = "openai" if provider_id == "realtime" else provider_id
+    if pid in LLM_PROVIDER_IDS and not sc.provider_allowed(pid):
+        return sc.provider_block_reason(pid)
+    return ""
+
+
 def first_enabled_llm(settings: dict[str, Any] | None = None) -> str:
-    enabled = enabled_providers_map(settings)
-    for pid in ("deepseek", "groq", "glm", "openai"):
-        if enabled.get(pid, True):
+    for pid in ("openai", "groq", "deepseek", "glm"):
+        if is_provider_enabled(settings, pid):
             return pid
+    if sc.hipaa_mode():
+        raise ValueError(
+            "No LLM provider is both enabled and on the HIPAA allow-list "
+            f"(PHI_ALLOWED_PROVIDERS={sorted(sc.allowed_llm_providers())})."
+        )
     raise ValueError("At least one LLM provider must stay enabled")
 
 
@@ -137,7 +157,7 @@ def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
     enabled = enabled_providers_map(data)
     apply_enabled_map(data, enabled)
     data["debug_mode"] = bool(data.get("debug_mode", False))
-    data["save_llm_messages"] = bool(data.get("save_llm_messages", False))
+    data["save_llm_messages"] = bool(data.get("save_llm_messages", False)) and sc.debug_dumps_allowed()
     data["vad_stop_secs"] = clamp_vad_stop_secs(data.get("vad_stop_secs"))
     data["cascade_llm"] = resolve_llm_choice(data, "cascade_llm")
     data["cli_llm"] = resolve_llm_choice(data, "cli_llm")
@@ -209,6 +229,9 @@ def apply_settings_to_env(settings: dict[str, Any] | None = None) -> None:
     os.environ["GLM_MODEL"] = str(s.get("glm_model") or DEFAULT_SETTINGS["glm_model"])
     os.environ["GROQ_MODEL"] = str(s.get("groq_model") or DEFAULT_SETTINGS["groq_model"])
     os.environ["DEEPSEEK_MODEL"] = str(s.get("deepseek_model") or DEFAULT_SETTINGS["deepseek_model"])
+    os.environ["OPENAI_CHAT_MODEL"] = str(
+        s.get("openai_chat_model") or DEFAULT_SETTINGS["openai_chat_model"]
+    )
     os.environ["OPENAI_REALTIME_MODEL"] = str(
         s.get("openai_realtime_model") or DEFAULT_SETTINGS["openai_realtime_model"]
     )
@@ -222,6 +245,22 @@ def apply_settings_to_env(settings: dict[str, Any] | None = None) -> None:
     os.environ["VAD_STOP_SECS"] = str(clamp_vad_stop_secs(s.get("vad_stop_secs")))
 
 
+LLM_MODEL_KEYS: dict[str, str] = {
+    "deepseek": "deepseek_model",
+    "glm": "glm_model",
+    "groq": "groq_model",
+    "openai": "openai_chat_model",
+}
+
+
+def llm_model_for(settings: dict[str, Any] | None, provider_id: str) -> str:
+    """Model id configured for an LLM provider (e.g. openai -> gpt-5.6-luna)."""
+    key = LLM_MODEL_KEYS.get((provider_id or "").strip().lower())
+    if not key:
+        return ""
+    return str((settings or {}).get(key) or DEFAULT_SETTINGS.get(key) or "")
+
+
 def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
     s = settings or load_settings()
     enabled = enabled_providers_map(s)
@@ -233,14 +272,15 @@ def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
             "groq": "Groq",
             "openai": "OpenAI Chat",
         }
-        return [
-            {
-                "id": pid,
-                "label": labels[pid] + ("" if enabled.get(pid, True) else " (disabled)"),
-                "enabled": bool(enabled.get(pid, True)),
-            }
-            for pid in order
-        ]
+        out = []
+        for pid in order:
+            blocked = provider_blocked_reason(pid)
+            on = bool(enabled.get(pid, True)) and not blocked
+            model = llm_model_for(s, pid)
+            label = labels[pid] + (f" · {model}" if model else "")
+            label += " (blocked: no BAA)" if blocked else ("" if on else " (disabled)")
+            out.append({"id": pid, "label": label, "enabled": on, "blocked": bool(blocked)})
+        return out
 
     return {
         "stt": [
@@ -256,8 +296,8 @@ def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
             {
                 "id": "realtime",
                 "label": "OpenAI Realtime"
-                + ("" if enabled.get("realtime", True) else " (disabled)"),
-                "enabled": bool(enabled.get("realtime", True)),
+                + ("" if is_provider_enabled(s, "realtime") else " (disabled)"),
+                "enabled": is_provider_enabled(s, "realtime"),
             },
         ],
         "openai_realtime_voices": [
@@ -273,7 +313,15 @@ def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
             "cedar",
         ],
         "enabled_providers": [
-            {"id": pid, "label": PROVIDER_LABELS[pid], "enabled": bool(enabled.get(pid, True))}
+            {
+                "id": pid,
+                "label": PROVIDER_LABELS[pid] + (" (blocked: no BAA)" if provider_blocked_reason(pid) else ""),
+                "enabled": bool(enabled.get(pid, True)) and not provider_blocked_reason(pid),
+                "blocked": bool(provider_blocked_reason(pid)),
+            }
             for pid in PROVIDER_IDS
         ],
+        "hipaa_mode": sc.hipaa_mode(),
+        "synthetic_data_only": sc.synthetic_data_only(),
+        "phi_allowed_providers": sorted(sc.allowed_llm_providers()),
     }

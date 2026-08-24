@@ -39,7 +39,15 @@ from pipecat.processors.frame_processor import FrameDirection
 
 from session_turn import set_last_user_message
 
-DEFAULT_CSV_PATH = Path(__file__).parent / "metrics" / "bot_messages.csv"
+try:
+    from security_config import hipaa_mode as _hipaa_mode, metrics_dir as _metrics_dir
+
+    DEFAULT_CSV_PATH = _metrics_dir() / "bot_messages.csv"
+except Exception:  # noqa: BLE001
+    DEFAULT_CSV_PATH = Path(__file__).parent / "metrics" / "bot_messages.csv"
+
+    def _hipaa_mode() -> bool:  # type: ignore[no-redef]
+        return True
 BOT_METRICS_CSV = Path(os.environ.get("BOT_METRICS_CSV", DEFAULT_CSV_PATH))
 
 _LOG_LOCK = Lock()
@@ -87,6 +95,14 @@ def _is_citation_text(text: str) -> bool:
 
 
 def _extract_user_text(messages: list[Any]) -> str:
+    """User utterance for the metrics CSV — withheld in HIPAA mode (only length kept)."""
+    raw = _extract_user_text_raw(messages)
+    if _hipaa_mode():
+        return f"[{len(raw)} chars]" if raw else ""
+    return raw
+
+
+def _extract_user_text_raw(messages: list[Any]) -> str:
     parts: list[str] = []
     for msg in messages:
         if not isinstance(msg, dict):

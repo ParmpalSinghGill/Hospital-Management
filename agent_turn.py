@@ -193,8 +193,28 @@ def _has_tool_calls(msg: Any) -> bool:
     return False
 
 
+def _clean_ai_text(msg: Any) -> str:
+    """Sanitized speakable text of one AI message ('' when leaky/unusable)."""
+    raw = _message_text(msg)
+    if not raw or not raw.strip():
+        return ""
+    if looks_like_tool_leak(raw) or is_incomplete_tool_reply(raw):
+        return ""
+    cleaned = sanitize_assistant_reply(raw)
+    if not cleaned or is_incomplete_tool_reply(cleaned) or looks_like_fake_handoff(cleaned):
+        return ""
+    return cleaned
+
+
 def extract_assistant_text(result: dict[str, Any]) -> str:
-    """Pick the last usable assistant utterance from the latest turn only."""
+    """Speakable assistant text for the latest turn.
+
+    The final no-tool-call AI message anchors the reply (none usable → "" so the
+    tool-recovery paths still fire). Interim AI content produced *alongside* tool
+    calls ("Sorry to hear about the knee pain. Let me find you a doctor.") is
+    real speech the model addressed to the caller — prepend it, deduped, instead
+    of dropping it.
+    """
     messages = result.get("messages", []) or []
 
     # Only inspect messages after the last user turn (avoids returning stale replies).
@@ -207,24 +227,30 @@ def extract_assistant_text(result: dict[str, Any]) -> str:
             start = i + 1
     turn_msgs = list(messages[start:]) if start < len(messages) else list(messages)
 
+    final = ""
     for msg in reversed(turn_msgs):
+        if not _is_ai_message(msg) or _has_tool_calls(msg):
+            continue
+        final = _clean_ai_text(msg)
+        if final:
+            break
+    if not final:
+        return ""
+
+    parts: list[str] = []
+    seen: set[str] = set()
+    for msg in turn_msgs:
         if not _is_ai_message(msg):
             continue
-        # Intermediate ReAct step with structured tool_calls — keep looking.
-        if _has_tool_calls(msg):
+        cleaned = _clean_ai_text(msg)
+        key = " ".join(cleaned.lower().split())
+        if not cleaned or key in seen:
             continue
-
-        raw = _message_text(msg)
-        if not raw or not raw.strip():
-            continue
-        if looks_like_tool_leak(raw) or is_incomplete_tool_reply(raw):
-            continue
-
-        cleaned = sanitize_assistant_reply(raw)
-        if cleaned and not is_incomplete_tool_reply(cleaned) and not looks_like_fake_handoff(cleaned):
-            return cleaned
-
-    return ""
+        seen.add(key)
+        parts.append(cleaned)
+        if key == " ".join(final.lower().split()):
+            break
+    return " ".join(parts) if parts else final
 
 
 def result_needs_tool_recovery(result: dict[str, Any]) -> bool:
@@ -417,6 +443,17 @@ def _log_turn_tool_calls(
         pass
 
 
+def _channel_from_thread_id(thread_id: str) -> str:
+    t = (thread_id or "").lower()
+    if t.startswith("tg_"):
+        return "telegram"
+    if t.startswith("dc_"):
+        return "discord"
+    if t.startswith("hospital_session_"):
+        return "cli"
+    return "web"
+
+
 def run_turn(
     app: Any,
     user_input: str,
@@ -434,10 +471,23 @@ def run_turn(
     except Exception:
         pass
 
-    config = {
+    config: dict[str, Any] = {
         "recursion_limit": recursion_limit,
         "configurable": {"thread_id": thread_id},
     }
+    # Optional Langfuse tracing (no-op unless LANGFUSE_* keys are set): one session
+    # per call/thread, tagged by channel so voice/CLI/Telegram/Discord are filterable.
+    try:
+        from tracing import with_tracing
+
+        config = with_tracing(
+            config,
+            session_id=log_id,
+            tags=["hospital-ai", _channel_from_thread_id(thread_id)],
+            metadata={"thread_id": thread_id, "call_id": call_id or ""},
+        )
+    except Exception:  # noqa: BLE001 — tracing must never break a turn
+        pass
     result = app.invoke({"messages": [("user", user_input)]}, config=config)
     text = extract_assistant_text(result)
     agent = str((result or {}).get("last_agent") or "")
