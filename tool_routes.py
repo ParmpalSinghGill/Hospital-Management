@@ -35,7 +35,7 @@ def _toollist_html(catalog: dict[str, Any]) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Hospital tools</title>
+  <title>ReceptionAi tools</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 2rem; line-height: 1.45; }}
     table {{ border-collapse: collapse; width: 100%; margin: 1rem 0 2rem; }}
@@ -47,7 +47,7 @@ def _toollist_html(catalog: dict[str, Any]) -> str:
   </style>
 </head>
 <body>
-  <h1>Hospital appointment tools</h1>
+  <h1>ReceptionAi front-desk tools</h1>
   <p>
     Machine-readable JSON:
     <a href="/api/tools">/api/tools</a>

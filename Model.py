@@ -6,6 +6,8 @@ load_dotenv()
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from llm_transport import async_http_client, hedge_count, hedge_delay_ms
+
 
 class LLMInspectHandler(BaseCallbackHandler):
     def on_llm_start(self, serialized, prompts, **kwargs):
@@ -44,13 +46,53 @@ def _deepseek_base_url() -> str:
     return os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 
-def _init_groq_model(callbacks_list) -> Any:
+def _hedged_classes():
+    """ChatOpenAI / ChatGroq subclasses that race duplicate requests over the shared client."""
     from langchain_groq import ChatGroq
+    from langchain_openai import ChatOpenAI
 
+    from llm_transport import HedgedChatMixin
+
+    class HedgedChatOpenAI(HedgedChatMixin, ChatOpenAI):
+        hedge_count: int = 1
+        hedge_delay_ms: int = 0
+
+    class HedgedChatGroq(HedgedChatMixin, ChatGroq):
+        hedge_count: int = 1
+        hedge_delay_ms: int = 0
+
+    return HedgedChatOpenAI, HedgedChatGroq
+
+
+_HEDGED: tuple | None = None
+
+
+def _transport_kwargs() -> dict[str, Any]:
+    """Shared HTTP/2 keep-alive client + hedge settings (see llm_transport.py)."""
+    return {
+        "http_async_client": async_http_client(),
+        "hedge_count": hedge_count(),
+        "hedge_delay_ms": hedge_delay_ms(),
+    }
+
+
+def _chat_openai(**kwargs: Any) -> Any:
+    global _HEDGED
+    _HEDGED = _HEDGED or _hedged_classes()
+    return _HEDGED[0](**kwargs, **_transport_kwargs())
+
+
+def _chat_groq(**kwargs: Any) -> Any:
+    global _HEDGED
+    _HEDGED = _HEDGED or _hedged_classes()
+    return _HEDGED[1](**kwargs, **_transport_kwargs())
+
+
+def _init_groq_model(callbacks_list) -> Any:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY not set. Please export GROQ_API_KEY before running.")
-    return ChatGroq(
+    return _chat_groq(
         model=_groq_model_name(),
         temperature=0,
         groq_api_key=api_key,
@@ -58,12 +100,11 @@ def _init_groq_model(callbacks_list) -> Any:
 
 
 def _init_glm_model(callbacks_list) -> Any:
-    from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("GLM_API_KEY")
     if not api_key:
         raise RuntimeError("GLM_API_KEY not set. Please export GLM_API_KEY before running.")
-    return ChatOpenAI(
+    return _chat_openai(
         model=_glm_model_name(),
         temperature=0,
         api_key=api_key,
@@ -72,12 +113,11 @@ def _init_glm_model(callbacks_list) -> Any:
 
 
 def _init_openai_model(callbacks_list) -> Any:
-    from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set. Please export OPENAI_API_KEY before running.")
-    return ChatOpenAI(
+    return _chat_openai(
         model=_openai_chat_model(),
         temperature=0,
         api_key=api_key,
@@ -85,13 +125,12 @@ def _init_openai_model(callbacks_list) -> Any:
 
 
 def _init_deepseek_model(callbacks_list) -> Any:
-    from langchain_openai import ChatOpenAI
 
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY not set. Please export DEEPSEEK_API_KEY before running.")
     # DeepSeek is OpenAI-compatible; disable parallel calls to reduce DSML text leaks.
-    return ChatOpenAI(
+    return _chat_openai(
         model=_deepseek_model_name(),
         temperature=0,
         api_key=api_key,

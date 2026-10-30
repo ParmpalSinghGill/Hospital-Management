@@ -1,8 +1,8 @@
-"""Unit tests for hospital intent routing helpers."""
+"""Unit tests for ReceptionAi intent routing helpers."""
 
 from __future__ import annotations
 
-from hospital_routing import (
+from reception_routing import (
     _is_greeting_only,
     _is_short_affirmation,
     _sticky_route_from_history,

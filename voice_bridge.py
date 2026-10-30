@@ -47,7 +47,7 @@ _SHARED_GRAPH = None
 _SHARED_GRAPH_PROVIDER: str | None = None
 
 
-def create_hospital_graph(*, llm_provider: str | None = None):
+def create_reception_graph(*, llm_provider: str | None = None):
     """Build the same LangGraph as CLI, with Cascade using admin/cascade LLM."""
     import os
 
@@ -62,7 +62,7 @@ def create_hospital_graph(*, llm_provider: str | None = None):
     return build_graph()
 
 
-def get_shared_hospital_graph(*, llm_provider: str | None = None):
+def get_shared_reception_graph(*, llm_provider: str | None = None):
     """Reuse one compiled graph so InMemorySaver checkpoints survive new calls."""
     global _SHARED_GRAPH, _SHARED_GRAPH_PROVIDER
     import os
@@ -73,8 +73,8 @@ def get_shared_hospital_graph(*, llm_provider: str | None = None):
     settings = load_settings()
     provider = llm_provider or settings.get("cascade_llm") or "deepseek"
     if _SHARED_GRAPH is None or _SHARED_GRAPH_PROVIDER != provider:
-        logger.info(f"Building shared hospital graph (provider={provider})")
-        _SHARED_GRAPH = create_hospital_graph(llm_provider=provider)
+        logger.info(f"Building shared reception graph (provider={provider})")
+        _SHARED_GRAPH = create_reception_graph(llm_provider=provider)
         _SHARED_GRAPH_PROVIDER = provider
     else:
         os.environ["LLM_PROVIDER"] = provider
@@ -284,7 +284,7 @@ def make_langgraph_processor(
     class GuardedTTSSpeakFrame(TTSSpeakFrame, UninterruptibleFrame):
         pass
 
-    class HospitalLangGraphProcessor(FrameProcessor):
+    class ReceptionLangGraphProcessor(FrameProcessor):
         def __init__(self):
             super().__init__()
             self._busy = False
@@ -322,7 +322,7 @@ def make_langgraph_processor(
             state["busy"] = True
             self.create_task(
                 self._drain_turns(user_text, direction),
-                name="hospital_langgraph_turn",
+                name="reception_langgraph_turn",
             )
 
         async def _flush_phone_buffer(self, direction: FrameDirection) -> None:
@@ -362,7 +362,7 @@ def make_langgraph_processor(
             self._cancel_phone_flush()
             self._phone_flush_task = self.create_task(
                 self._flush_phone_buffer(direction),
-                name="hospital_phone_fragment_flush",
+                name="reception_phone_fragment_flush",
             )
 
         async def _push_spoken_reply(self, reply: str, direction: FrameDirection):
@@ -503,10 +503,10 @@ def make_langgraph_processor(
 
             await self.push_frame(frame, direction)
 
-    return HospitalLangGraphProcessor()
+    return ReceptionLangGraphProcessor()
 
 
-def hospital_function_schemas():
+def reception_function_schemas():
     """Pipecat FunctionSchema list mirroring Tools.py."""
     from pipecat.adapters.schemas.function_schema import FunctionSchema
 
@@ -617,11 +617,11 @@ def hospital_function_schemas():
     ]
 
 
-def register_hospital_tools_on_llm(llm) -> list:
+def register_reception_tools_on_llm(llm) -> list:
     """Register Tools.py handlers on a Pipecat LLM (used by Realtime)."""
     from pipecat.services.llm_service import FunctionCallParams
 
-    schemas = hospital_function_schemas()
+    schemas = reception_function_schemas()
 
     for name, lc_tool in _LC_TOOLS.items():
 
@@ -667,19 +667,39 @@ def register_hospital_tools_on_llm(llm) -> list:
     return schemas
 
 
-REALTIME_SYSTEM = (
-    "You are a warm hospital front-desk assistant on a live voice call. "
-    "Sound like a real person — soft, brief, never like a menu. "
-    "FLOW: greet first ('Hi, how can I help you today?'); if need unclear ask "
-    "'What brings you in today?' — NEVER list book/cancel/reschedule/prescriptions. "
-    "When intent is clear from natural speech, acknowledge and ask phone; confirm phone; "
-    "confirm name from lookup or collect+save for new patients; then help using intent + history. "
-    "If they already have a visit, tell them and offer to keep/move/cancel. "
-    "If not, offer to set one up softly. Medicine/timing questions → get_prescriptions. "
-    "Use tools for lookup, booking, cancel, reschedule, doctors, prescriptions — never invent IDs. "
-    "One short sentence per turn. Good: 'What brings you in today?' / "
-    "'Sorry about that. What's your phone number?' "
-    "Never identify a patient from chat memory alone. Never look up by name alone. "
-    "After verified registration, call lookup_patient with department and follow booking_guidance. "
-    "NEVER ask for DOB, age, or government ID. No markdown, bullets, or emojis."
-)
+def realtime_system_prompt() -> str:
+    """System prompt for the OpenAI Realtime pipeline, worded for this industry."""
+    from industry_profile import current as _industry
+
+    ind = _industry()
+    rx = (
+        "Medicine/timing questions → get_prescriptions. "
+        if ind.supports_prescriptions
+        else ""
+    )
+    return (
+        f"You are a warm front-desk assistant at {ind.venue} on a live voice call. "
+        "Sound like a real person — soft, brief, never like a menu. "
+        "FLOW: greet first ('Hi, how can I help you today?'); if need unclear ask "
+        "'What can I do for you?' — NEVER list book/cancel/reschedule. "
+        "When intent is clear from natural speech, acknowledge and ask phone; confirm phone; "
+        f"confirm name from lookup or collect+save for new {ind.customer_label}s; "
+        "then help using intent + history. "
+        f"If they already have a {ind.booking_label}, tell them and offer to keep/move/cancel. "
+        f"If not, offer to set one up softly. {rx}"
+        "Use tools for lookup, booking, cancel, reschedule and availability — never invent IDs. "
+        f"The tools are named for a clinic but here they manage {ind.plural_note()}; "
+        f"speak to the caller using {ind.resource_label}/{ind.customer_label}/"
+        f"{ind.booking_label}. "
+        "One short sentence per turn. Good: 'What can I do for you?' / "
+        "'Sorry about that. What's your phone number?' "
+        f"Never identify a {ind.customer_label} from chat memory alone. "
+        "Never look up by name alone. "
+        "After verified registration, call lookup_patient with department and follow "
+        "booking_guidance. "
+        "NEVER ask for DOB, age, or government ID. No markdown, bullets, or emojis."
+    )
+
+
+# Back-compat: modules importing the constant get the current industry's wording.
+REALTIME_SYSTEM = realtime_system_prompt()

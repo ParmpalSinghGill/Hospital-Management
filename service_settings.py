@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from industry_profile import DEFAULT_INDUSTRY, INDUSTRY_IDS
+
 _ROOT = Path(__file__).resolve().parent
 SETTINGS_PATH = _ROOT / "admin_settings.json"
 
@@ -25,6 +27,10 @@ PROVIDER_LABELS: dict[str, str] = {
 }
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # Which vertical the assistant speaks for (hospital | restaurant | hotel).
+    "industry": DEFAULT_INDUSTRY,
+    # Display name used in greetings and UI headers.
+    "business_name": "ReceptionAi",
     "stt": "deepgram",
     "tts": "deepgram",
     "cascade_llm": "deepseek",
@@ -50,6 +56,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 ALLOWED = {
+    "industry": set(INDUSTRY_IDS),
     "stt": {"deepgram"},
     "tts": {"deepgram"},
     "cascade_llm": {"glm", "groq", "openai", "deepseek"},
@@ -136,6 +143,11 @@ def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
     # Keep flat enable_* flags as source of truth; expose nested map for the UI/API.
     enabled = enabled_providers_map(data)
     apply_enabled_map(data, enabled)
+    industry = str(data.get("industry") or DEFAULT_INDUSTRY).strip().lower()
+    data["industry"] = industry if industry in ALLOWED["industry"] else DEFAULT_INDUSTRY
+    data["business_name"] = (
+        str(data.get("business_name") or "").strip() or DEFAULT_SETTINGS["business_name"]
+    )
     data["debug_mode"] = bool(data.get("debug_mode", False))
     data["save_llm_messages"] = bool(data.get("save_llm_messages", False))
     data["vad_stop_secs"] = clamp_vad_stop_secs(data.get("vad_stop_secs"))
@@ -203,8 +215,21 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
 
 
 def apply_settings_to_env(settings: dict[str, Any] | None = None) -> None:
-    """Push settings into process env so voice/CLI modules pick them up."""
+    """Push settings into process env so voice/CLI modules pick them up.
+
+    Industry/business name are special: a value in the environment (``.env`` or the
+    shell) wins at startup, because the settings file always carries a default and
+    would otherwise silently clobber ``INDUSTRY=restaurant python bot.py``.
+    An explicit Admin save passes ``settings`` and does override the env.
+    """
+    explicit = settings is not None
     s = _coerce_settings(dict(settings or load_settings()))
+    if explicit or not os.environ.get("INDUSTRY"):
+        os.environ["INDUSTRY"] = str(s.get("industry") or DEFAULT_INDUSTRY)
+    if explicit or not os.environ.get("BUSINESS_NAME"):
+        os.environ["BUSINESS_NAME"] = str(
+            s.get("business_name") or DEFAULT_SETTINGS["business_name"]
+        )
     os.environ["DEEPGRAM_VOICE"] = str(s.get("deepgram_voice") or DEFAULT_SETTINGS["deepgram_voice"])
     os.environ["GLM_MODEL"] = str(s.get("glm_model") or DEFAULT_SETTINGS["glm_model"])
     os.environ["GROQ_MODEL"] = str(s.get("groq_model") or DEFAULT_SETTINGS["groq_model"])
@@ -242,7 +267,12 @@ def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
             for pid in order
         ]
 
+    from industry_profile import all_profiles
+
     return {
+        "industry": [
+            {"id": p["id"], "label": p["label"], "enabled": True} for p in all_profiles()
+        ],
         "stt": [
             {"id": "deepgram", "label": "Deepgram STT", "enabled": True},
         ],

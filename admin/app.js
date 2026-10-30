@@ -261,6 +261,8 @@ async function loadSettings() {
     }) ||
     normalizeEnabledMap(o.enabled_providers);
   writeEnabledProviders(enabled);
+  fillSelect(document.getElementById("industry"), o.industry, s.industry);
+  setFieldValue("business_name", s.business_name);
   fillSelect(document.getElementById("stt"), o.stt, s.stt);
   fillSelect(document.getElementById("tts"), o.tts, s.tts);
   fillSelect(document.getElementById("cascade_llm"), o.cascade_llm, s.cascade_llm);
@@ -372,6 +374,8 @@ async function saveSettings() {
     enable_groq: Boolean(enabled.groq),
     enable_openai: Boolean(enabled.openai),
     enable_realtime: Boolean(enabled.realtime),
+    industry: document.getElementById("industry")?.value,
+    business_name: document.getElementById("business_name")?.value,
     stt: document.getElementById("stt")?.value,
     tts: document.getElementById("tts")?.value,
     cascade_llm: document.getElementById("cascade_llm")?.value,

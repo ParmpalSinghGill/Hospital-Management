@@ -15,7 +15,7 @@ BASE_DIR = os.path.dirname(__file__)
 DATASET_DIR = os.path.join(BASE_DIR, "dataset")
 
 
-DB_PATH = os.path.join(DATASET_DIR, "hospital.db")
+DB_PATH = os.path.join(DATASET_DIR, "reception.db")
 
 
 DOCTORS_DB = os.path.join(DATASET_DIR, "doctors.json")

@@ -1,4 +1,4 @@
-"""Machine-readable catalog of hospital appointment tools (Tools.py).
+"""Machine-readable catalog of ReceptionAi front-desk tools (Tools.py).
 
 Used by HTTP discovery routes and any external integrator that needs tool
 metadata without importing LangGraph or Pipecat.

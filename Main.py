@@ -1,4 +1,4 @@
-"""Hospital AI assistant entrypoint (CLI) and public graph exports."""
+"""ReceptionAi front-desk assistant entrypoint (CLI) and public graph exports."""
 from __future__ import annotations
 
 import json
@@ -8,8 +8,8 @@ import sys
 from datetime import datetime
 
 from agent_turn import run_turn
-from hospital_agents import (  # noqa: F401
-    HospitalName,
+from reception_agents import (  # noqa: F401
+    BusinessName,
     build_booking_agent,
     build_cancellation_agent,
     build_general_agent,
@@ -17,8 +17,8 @@ from hospital_agents import (  # noqa: F401
     build_reschedule_agent,
     build_router_agent,
 )
-from hospital_graph import GraphState, build_graph  # noqa: F401
-from hospital_routing import (  # noqa: F401
+from reception_graph import GraphState, build_graph  # noqa: F401
+from reception_routing import (  # noqa: F401
     _is_greeting_only,
     _is_short_affirmation,
     _sticky_route_from_history,
@@ -52,11 +52,11 @@ def main():
     chats_dir = os.path.join(base_dir, "chats")
     os.makedirs(chats_dir, exist_ok=True)
     session_name = datetime.now().strftime("chat-%Y%m%d-%H%M%S.jsonl")
-    import hospital_graph
+    import reception_graph
 
-    hospital_graph.CHAT_LOG_PATH = os.path.join(chats_dir, session_name)
+    reception_graph.CHAT_LOG_PATH = os.path.join(chats_dir, session_name)
     try:
-        with open(hospital_graph.CHAT_LOG_PATH, "a", encoding="utf-8") as f:
+        with open(reception_graph.CHAT_LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps({"session_started": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}) + "\n")
     except Exception as e:
         logging.error(f"Failed to initialize chat log file: {e}")
@@ -64,7 +64,7 @@ def main():
     app = build_graph()
 
     # Create a unique thread ID for this session
-    thread_id = f"hospital_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    thread_id = f"reception_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     call_id = thread_id
     start_call(
         call_id,
@@ -112,7 +112,7 @@ def main():
         end_call(call_id)
         return
 
-    print("Hospital Agent ready. Type your request (Ctrl+C to exit).\n")
+    print("ReceptionAi front desk ready. Type your request (Ctrl+C to exit).\n")
     try:
         while True:
             user_input = input("> ").strip()

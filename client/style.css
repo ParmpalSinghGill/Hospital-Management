@@ -816,3 +816,51 @@ body.in-call .action-button.voice {
 .avg-panel:not([hidden]) { display: flex; }
 
 .voice-overlay { display: none !important; }
+
+/* ---- Tap-to-call fallback (arriving from the landing page with ?call=1) ---- */
+.autocall-veil {
+  position: fixed;
+  inset: 0;
+  z-index: 999;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: rgba(9, 32, 30, 0.55);
+  backdrop-filter: blur(6px);
+}
+.autocall-card {
+  max-width: 22rem;
+  width: 100%;
+  text-align: center;
+  padding: 1.8rem 1.6rem;
+  border-radius: 20px;
+  background: var(--surface-strong, #fff);
+  border: 1px solid var(--line, rgba(20, 48, 44, 0.12));
+  box-shadow: 0 30px 70px rgba(9, 32, 30, 0.3);
+}
+.autocall-title {
+  font-family: var(--font-display, Georgia, serif);
+  font-size: 1.3rem;
+  font-weight: 650;
+  color: var(--teal-deep, #0f4a45);
+  margin-bottom: 0.4rem;
+}
+.autocall-copy {
+  margin: 0 0 1.2rem;
+  font-size: 0.92rem;
+  line-height: 1.5;
+  color: var(--muted, #6a857f);
+}
+.autocall-btn {
+  width: 100%;
+  padding: 0.8rem 1.2rem;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  color: #fff;
+  background: linear-gradient(145deg, var(--teal, #1a6b63), var(--teal-deep, #0f4a45));
+  box-shadow: 0 14px 30px rgba(15, 74, 69, 0.25);
+}
+.autocall-btn:hover { filter: brightness(1.06); }

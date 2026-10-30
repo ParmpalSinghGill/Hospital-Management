@@ -1,4 +1,4 @@
-"""Intent routing helpers for the hospital LangGraph."""
+"""Intent routing helpers for the ReceptionAi LangGraph."""
 from __future__ import annotations
 
 import re

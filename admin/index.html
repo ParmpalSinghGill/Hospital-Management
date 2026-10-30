@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DBC Care — Admin</title>
+  <title>ReceptionAi — Admin</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -15,7 +15,7 @@
   <section id="login-view" class="login-view is-active">
     <div class="login-panel">
       <div class="mark" aria-hidden="true"></div>
-      <h1>DBC Care Admin</h1>
+      <h1>ReceptionAi Admin</h1>
       <p class="sub">Credits, routing &amp; hospital records</p>
       <form id="login-form">
         <label>
@@ -29,7 +29,7 @@
         <p id="login-error" class="error" hidden></p>
         <button type="submit">Sign in</button>
       </form>
-      <a class="back-home" href="/">← Back to DBC Care</a>
+      <a class="back-home" href="/">← Back to ReceptionAi</a>
     </div>
   </section>
 
@@ -97,6 +97,23 @@
               <label class="toggle-row">
                 <span>OpenAI Realtime <em class="costly">costly</em></span>
                 <input type="checkbox" data-provider="realtime" />
+              </label>
+            </div>
+          </section>
+
+          <section class="settings-block">
+            <header class="settings-block-head">
+              <h3>Business</h3>
+              <p>Which kind of front desk this is. Changes the words the assistant uses.</p>
+            </header>
+            <div class="field-row">
+              <label>
+                <span>Industry</span>
+                <select id="industry" name="industry"></select>
+              </label>
+              <label>
+                <span>Business name</span>
+                <input id="business_name" name="business_name" placeholder="ReceptionAi" />
               </label>
             </div>
           </section>

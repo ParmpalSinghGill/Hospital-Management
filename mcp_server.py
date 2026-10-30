@@ -1,4 +1,4 @@
-"""Hospital appointment MCP server — reuses Tools.py (no duplicate tools).
+"""ReceptionAi front-desk MCP server — reuses Tools.py (no duplicate tools).
 
 Exposes every LangChain tool from ``tool_catalog.ALL_TOOLS`` over MCP so
 ChatGPT / Cursor / other MCP clients can discover and call them.
@@ -52,14 +52,28 @@ from mcp_demo_oauth import DemoOAuthProvider  # noqa: E402
 from tool_catalog import ALL_TOOLS, build_tool_catalog  # noqa: E402
 
 
-INSTRUCTIONS = (
-    "You are connected to the DBC Care hospital appointment tools. "
-    "Use these tools to look up patients, list doctors, book / cancel / "
-    "reschedule appointments, and fetch prescriptions. "
-    "Always verify identity with phone before booking. "
-    "Never invent appointment IDs, patient IDs, or doctor names — "
-    "only use values returned by tools."
-)
+def _instructions() -> str:
+    """MCP client guidance, worded for the configured industry.
+
+    Tool *names* stay clinic-flavoured on purpose — they are a published contract
+    that existing MCP clients bind to. Only the prose changes.
+    """
+    from industry_profile import current
+
+    ind = current()
+    rx = " and fetch prescriptions" if ind.supports_prescriptions else ""
+    return (
+        f"You are connected to the ReceptionAi front-desk tools for {ind.venue}. "
+        f"Use these tools to look up a {ind.customer_label}, list available "
+        f"{ind.resource_plural}, book / cancel / reschedule a {ind.booking_label}{rx}. "
+        f"The tools are named for a clinic (lookup_patient, list_doctors) but here they "
+        f"operate on {ind.plural_note()}. "
+        "Always verify identity with phone before booking. "
+        "Never invent IDs or names — only use values returned by tools."
+    )
+
+
+INSTRUCTIONS = _instructions()
 
 
 def _wrap_langchain_tool(lc_tool: Any) -> Callable[..., str]:
@@ -145,7 +159,7 @@ def _browser_home_html(*, public_url: str | None = None, oauth: bool = False) ->
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Hospital MCP</title>
+<title>ReceptionAi MCP</title>
 <style>
  body{{font-family:system-ui,sans-serif;margin:2rem;line-height:1.45;max-width:52rem}}
  code{{background:#f3f3f3;padding:.1rem .35rem;border-radius:4px}}
@@ -154,7 +168,7 @@ def _browser_home_html(*, public_url: str | None = None, oauth: bool = False) ->
  th{{background:#f4f4f4}}
  .box{{background:#f8f8f8;padding:1rem;border-radius:8px;margin:1rem 0}}
 </style></head><body>
-<h1>Hospital AI — MCP server</h1>
+<h1>ReceptionAi — MCP server</h1>
 <p>This page is for humans. ChatGPT / MCP clients use the protocol endpoint below.</p>
 {auth_note}
 <div class="box">
@@ -176,7 +190,7 @@ def build_mcp(
     public_url: str | None = None,
     enable_oauth: bool = False,
 ) -> FastMCP:
-    """Create FastMCP app with all hospital tools registered once."""
+    """Create FastMCP app with all front-desk tools registered once."""
     auth_kwargs: dict[str, Any] = {}
     if enable_oauth:
         base = (public_url or "").rstrip("/")
@@ -202,7 +216,7 @@ def build_mcp(
         }
 
     mcp = FastMCP(
-        name="hospital-ai-assistant",
+        name="receptionai",
         instructions=INSTRUCTIONS,
         host=host,
         port=port,
@@ -261,7 +275,7 @@ def build_mcp(
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Hospital AI Assistant MCP server (wraps Tools.py).",
+        description="ReceptionAi MCP server (wraps Tools.py).",
     )
     parser.add_argument(
         "--transport",
@@ -334,7 +348,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     pub = public_url or f"http://{args.host}:{args.port}"
     print(
-        f"Hospital MCP server ({args.transport}) on {endpoint}\n"
+        f"ReceptionAi MCP server ({args.transport}) on {endpoint}\n"
         f"Browser page: {pub}/\n"
         f"ChatGPT URL:  {pub}/mcp\n"
         f"OAuth: {'ON (demo DCR)' if args.oauth else 'OFF — use No Authentication in ChatGPT'}\n"

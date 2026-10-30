@@ -1,4 +1,4 @@
-"""Compile the hospital multi-agent LangGraph."""
+"""Compile the ReceptionAi multi-agent LangGraph."""
 from __future__ import annotations
 
 import json
@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
-from hospital_agents import (
+from reception_agents import (
     build_booking_agent,
     build_cancellation_agent,
     build_general_agent,
@@ -19,7 +19,7 @@ from hospital_agents import (
     build_reschedule_agent,
     build_router_agent,
 )
-from hospital_routing import (
+from reception_routing import (
     _SYMPTOM_BOOKING_HINTS,
     _is_greeting_only,
     _is_short_affirmation,

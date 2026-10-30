@@ -220,7 +220,7 @@
     const doc = data.doctor || {};
     nameEl.textContent = doc.name || doctorId;
     document.getElementById("doctor-title").textContent = doc.name || "Doctor schedule";
-    document.title = `DBC Care — ${doc.name || doctorId}`;
+    document.title = `ReceptionAi — ${doc.name || doctorId}`;
     const st = data.stats || {};
     statsEl.textContent =
       `${st.booked || 0} booked · ${st.free || 0} free · ${st.unavailable || 0} unavailable · ` +

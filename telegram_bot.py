@@ -1,4 +1,4 @@
-"""Telegram channel for hospital appointment booking.
+"""Telegram channel for ReceptionAi front-desk booking.
 
 Uses the same Main.py LangGraph + Tools.py flow as CLI / voice Cascade.
 Requires TELEGRAM_BOT_TOKEN in `.env`.
@@ -33,27 +33,40 @@ from conversation_log import (  # noqa: E402
     start_call,
 )
 from conversation_log import _utc_iso  # noqa: E402
-from voice_bridge import get_shared_hospital_graph  # noqa: E402
+from voice_bridge import get_shared_reception_graph  # noqa: E402
 
 TELEGRAM_API = "https://api.telegram.org"
 MAX_MESSAGE_LEN = 4000
 
-_WELCOME = (
-    "Hi — I'm the DBC Care front desk.\n\n"
-    "Tell me what brings you in today (a visit, medicines, or anything else we can help with). "
-    "I'll ask for your phone when we need to pull up your record.\n\n"
-    "Commands:\n"
-    "/start — welcome\n"
-    "/help — how this works\n"
-    "/reset — start a fresh conversation"
-)
 
-_HELP = (
-    "Just say what you need in your own words — no menus.\n"
-    "I'll greet you, learn what you need, then ask for phone and name to look you up.\n"
-    "Clinic hours: 9:00 AM–5:00 PM (lunch 2:00–3:00 PM).\n"
-    "Use /reset if you want to start over."
-)
+def _welcome() -> str:
+    from industry_profile import current
+
+    ind = current()
+    business = (os.getenv("BUSINESS_NAME") or "ReceptionAi").strip()
+    return (
+        f"Hi — I'm the {business} front desk.\n\n"
+        "Tell me what you need in your own words. "
+        "I'll ask for your phone when we need to pull up your record.\n\n"
+        f"I can book, cancel or move a {ind.booking_label}, and answer general questions.\n\n"
+        "Commands:\n"
+        "/start — welcome\n"
+        "/help — how this works\n"
+        "/reset — start a fresh conversation"
+    )
+
+
+def _help() -> str:
+    from industry_profile import current
+
+    ind = current()
+    return (
+        "Just say what you need in your own words — no menus.\n"
+        "I'll greet you, learn what you need, then ask for phone and name to look you up.\n"
+        f"I handle {ind.booking_plural}: booking, cancelling and rescheduling.\n"
+        "Hours: 9:00 AM–5:00 PM (2:00–3:00 PM unavailable).\n"
+        "Use /reset if you want to start over."
+    )
 
 
 class TelegramSession:
@@ -93,7 +106,7 @@ class TelegramBot:
         self.token = token.strip()
         self.base = f"{TELEGRAM_API}/bot{self.token}"
         self.sessions: dict[int, TelegramSession] = {}
-        self.graph = get_shared_hospital_graph()
+        self.graph = get_shared_reception_graph()
         self._offset = 0
 
     def _session(self, chat_id: int, from_user: dict[str, Any] | None = None) -> TelegramSession:
@@ -201,7 +214,7 @@ class TelegramBot:
         cmd = text.split()[0].lower().split("@", 1)[0]
 
         if cmd in ("/start", "/help"):
-            await self.send_message(client, chat_id, _WELCOME if cmd == "/start" else _HELP)
+            await self.send_message(client, chat_id, _welcome() if cmd == "/start" else _help())
             return
 
         if cmd == "/reset":

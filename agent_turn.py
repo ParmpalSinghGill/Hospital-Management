@@ -425,7 +425,7 @@ def run_turn(
     recursion_limit: int = 25,
     call_id: str | None = None,
 ) -> TurnResult:
-    """Run one user turn on the compiled hospital LangGraph app."""
+    """Run one user turn on the compiled ReceptionAi LangGraph app."""
     log_id = call_id or thread_id
     try:
         from conversation_log import set_current_call_id

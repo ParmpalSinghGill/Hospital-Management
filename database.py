@@ -1,4 +1,4 @@
-"""Hospital data layer — SQLite store under dataset/hospital.db.
+"""ReceptionAi data layer — SQLite store under dataset/reception.db.
 
 Public helpers keep the same names Tools.py / admin_routes.py / MakeDataBase.py
 already use (_load_*, _save_*, lookup helpers, time normalization).

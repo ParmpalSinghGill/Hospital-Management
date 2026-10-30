@@ -1,4 +1,4 @@
-"""Hospital AI — voice upgrade of the existing LangGraph agent.
+"""ReceptionAi — voice upgrade of the existing LangGraph agent.
 
 Wraps the same ``Main.py`` / ``Tools.py`` appointment flow:
 
@@ -59,11 +59,11 @@ from soft_speech_turn_start import SoftSpeechUserTurnStartStrategy
 from turn_metrics import TurnMetricsObserver
 from user_mute_safe import SafeBotSpeakingMuteStrategy
 from voice_bridge import (
-    REALTIME_SYSTEM,
-    get_shared_hospital_graph,
-    hospital_function_schemas,
+    realtime_system_prompt,
+    get_shared_reception_graph,
+    reception_function_schemas,
     make_langgraph_processor,
-    register_hospital_tools_on_llm,
+    register_reception_tools_on_llm,
 )
 
 _ROOT = Path(__file__).resolve().parent
@@ -170,7 +170,7 @@ def build_cascade_pipeline(
 
     call_key = call_id or thread_id
     state = shared_state if shared_state is not None else {}
-    graph_app = get_shared_hospital_graph(llm_provider=os.getenv("LLM_PROVIDER", "deepseek"))
+    graph_app = get_shared_reception_graph(llm_provider=os.getenv("LLM_PROVIDER", "deepseek"))
     agent = make_langgraph_processor(
         thread_id, graph_app, call_id=call_key, shared_state=state
     )
@@ -266,16 +266,19 @@ def build_cascade_pipeline(
 
 
 def build_realtime_pipeline(transport: BaseTransport, context: LLMContext) -> Pipeline:
-    """OpenAI Realtime + hospital Tools.py handlers only."""
-    tool_schemas = hospital_function_schemas()
+    """OpenAI Realtime + ReceptionAi Tools.py handlers only."""
+    tool_schemas = reception_function_schemas()
+
+    # Resolved per session so an industry change in Admin takes effect on the next call.
+    realtime_system = realtime_system_prompt()
 
     llm = OpenAIRealtimeLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
         settings=OpenAIRealtimeLLMSettings(
             model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2.1-mini"),
-            system_instruction=REALTIME_SYSTEM,
+            system_instruction=realtime_system,
             session_properties=SessionProperties(
-                instructions=REALTIME_SYSTEM,
+                instructions=realtime_system,
                 audio=AudioConfiguration(
                     input=AudioInput(
                         transcription=InputAudioTranscription(),
@@ -290,7 +293,7 @@ def build_realtime_pipeline(transport: BaseTransport, context: LLMContext) -> Pi
         ),
     )
 
-    context.set_tools(register_hospital_tools_on_llm(llm))
+    context.set_tools(register_reception_tools_on_llm(llm))
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(context)
 
     return Pipeline(
@@ -346,7 +349,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     )
 
     logger.info(
-        f"Starting Hospital voice (mode={mode}, stop_secs={stop_secs}, "
+        f"Starting ReceptionAi voice (mode={mode}, stop_secs={stop_secs}, "
         f"call_id={call_id}, thread_id={thread_id}, webrtc_session={webrtc_session_id or 'n/a'})"
     )
 
@@ -441,93 +444,6 @@ async def bot(runner_args: RunnerArguments):
     await run_bot(transport, runner_args)
 
 
-_CHOOSER_HTML = """\
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>DBC Care — Appointments</title>
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-<style>
-  :root {
-    --teal: #1a6b63; --teal-deep: #0f4a45; --ink: #14302c; --muted: #6a857f;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; color: var(--ink);
-    font-family: "Plus Jakarta Sans", system-ui, sans-serif;
-    background:
-      radial-gradient(1000px 520px at 8% -8%, #c8e8e1 0%, transparent 55%),
-      radial-gradient(800px 420px at 100% 0%, #d5e8f2 0%, transparent 50%),
-      linear-gradient(180deg, #eef6f3, #f7faf8 50%, #eef2f0);
-  }
-  main {
-    min-height: 100vh; display: flex; flex-direction: column;
-    justify-content: center; padding: 2.5rem 1.5rem; max-width: 920px; margin: 0 auto;
-  }
-  .mark {
-    width: 3rem; height: 3rem; border-radius: 14px;
-    background: linear-gradient(145deg, var(--teal), var(--teal-deep));
-    position: relative; margin-bottom: 1.1rem;
-  }
-  .mark::after {
-    content: ""; position: absolute; inset: 0; margin: auto; width: 1.1rem; height: 1.1rem;
-    background:
-      linear-gradient(#e8f6f3,#e8f6f3) center/0.25rem 100% no-repeat,
-      linear-gradient(#e8f6f3,#e8f6f3) center/100% 0.25rem no-repeat;
-  }
-  .brand {
-    font-family: "Fraunces", Georgia, serif; font-size: clamp(2.4rem, 6vw, 3.6rem);
-    font-weight: 650; letter-spacing: -0.03em; color: var(--teal-deep); margin: 0 0 0.4rem;
-  }
-  .lead { margin: 0 0 2rem; max-width: 28rem; color: var(--muted); font-size: 1.05rem; line-height: 1.5; }
-  .ways { display: grid; gap: 0.9rem; }
-  @media (min-width: 720px) { .ways { grid-template-columns: 1fr 1fr; } }
-  @media (min-width: 980px) { .ways { grid-template-columns: 1fr 1fr 1fr 1fr; } }
-  a.way {
-    display: block; text-decoration: none; color: inherit;
-    padding: 1.35rem 1.2rem; border-radius: 18px;
-    background: rgba(255,255,255,0.85); border: 1px solid rgba(20,48,44,0.1);
-    box-shadow: 0 18px 40px rgba(15,74,69,0.07);
-    transition: transform 0.18s ease, border-color 0.18s ease;
-  }
-  a.way:hover { transform: translateY(-3px); border-color: rgba(26,107,99,0.35); }
-  a.way .name { font-family: "Fraunces", Georgia, serif; font-size: 1.25rem; font-weight: 650; color: var(--teal-deep); margin-bottom: 0.3rem; }
-  a.way .desc { font-size: 0.9rem; color: var(--muted); line-height: 1.4; }
-</style>
-</head>
-<body>
-  <main>
-    <div class="mark" aria-hidden="true"></div>
-    <h1 class="brand">DBC Care</h1>
-    <p class="lead">One chat window for appointments — type or call. Pick providers in Admin.</p>
-    <div class="ways">
-      <a class="way" href="/app/">
-        <div class="name">Open chat</div>
-        <div class="desc">Single thread for messages and live calls.</div>
-      </a>
-      <a class="way" href="/admin/">
-        <div class="name">Admin</div>
-        <div class="desc">Choose Cascade / Realtime, LLMs, and debug timings.</div>
-      </a>
-      <a class="way" href="/app-lite/">
-        <div class="name">Voice only</div>
-        <div class="desc">Optional lean audio desk.</div>
-      </a>
-      <a class="way" href="/client/">
-        <div class="name">Tech Console</div>
-        <div class="desc">Pipecat prebuilt WebRTC debug client.</div>
-      </a>
-    </div>
-  </main>
-</body>
-</html>
-"""
-
-
 def _mount_custom_client() -> None:
     from fastapi.responses import HTMLResponse
     from fastapi.staticfiles import StaticFiles
@@ -559,7 +475,16 @@ def _mount_custom_client() -> None:
 
     @app.get("/", include_in_schema=False)
     async def root_chooser():
-        return HTMLResponse(_CHOOSER_HTML)
+        # Rendered per request so an industry change in Admin shows up immediately.
+        from landing import render
+
+        return HTMLResponse(render())
+
+    @app.get("/api/industry", include_in_schema=False)
+    async def industry_info():
+        from industry_profile import all_profiles, describe
+
+        return {"ok": True, "active": describe(), "available": all_profiles()}
 
 
 if __name__ == "__main__":

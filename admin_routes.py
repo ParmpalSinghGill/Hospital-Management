@@ -1,4 +1,4 @@
-"""Admin API routes: login, credits, service provider settings, hospital data views."""
+"""Admin API routes: login, credits, industry & provider settings, data views."""
 
 from __future__ import annotations
 
@@ -114,6 +114,8 @@ class LoginBody(BaseModel):
 
 
 class SettingsBody(BaseModel):
+    industry: str | None = None
+    business_name: str | None = None
     stt: str | None = None
     tts: str | None = None
     cascade_llm: str | None = None
@@ -253,7 +255,7 @@ async def put_settings(body: SettingsBody, admin_token: str | None = Cookie(defa
     return {"ok": True, "settings": saved}
 
 
-# -------- Hospital data APIs --------
+# -------- Front-desk data APIs --------
 @router.get("/api/departments")
 async def departments(admin_token: str | None = Cookie(default=None)):
     _require_auth(admin_token)

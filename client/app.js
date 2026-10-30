@@ -1191,3 +1191,58 @@ refreshMicList().catch((err) => console.warn("Initial mic list failed", err));
 newPatientBtn?.addEventListener("click", () => {
   startNewPatientSession().catch((err) => console.warn("new patient failed", err));
 });
+
+/* ---- Auto-start a call when arrived from the landing page (/app/?call=1) ----
+ * Mic access and audio playback need a user gesture. A same-tab navigation from
+ * a click usually carries enough activation, but Safari/iOS and a cold permission
+ * prompt do not — so fall back to a one-tap overlay instead of failing silently.
+ */
+async function startCallFlow() {
+  await ensureConnected();
+  await refreshMicList({ requestPermission: true });
+  await startVoiceCapture();
+  await openCallDock();
+  if (botAudio) {
+    botAudio.muted = false;
+    await botAudio.play().catch((err) => console.warn("Bot audio play failed", err));
+  }
+}
+
+function showTapToCall() {
+  if (document.getElementById("autocall-veil")) return;
+  const veil = document.createElement("div");
+  veil.id = "autocall-veil";
+  veil.className = "autocall-veil";
+  veil.innerHTML = `
+    <div class="autocall-card">
+      <div class="autocall-title">Ready when you are</div>
+      <p class="autocall-copy">Tap below and allow microphone access to talk to the assistant.</p>
+      <button type="button" class="autocall-btn">Start call</button>
+    </div>`;
+  const dismiss = () => veil.remove();
+  veil.querySelector(".autocall-btn").addEventListener("click", async () => {
+    dismiss();
+    try {
+      await startCallFlow();
+    } catch (err) {
+      showBanner("Could not start the call: " + (err?.message || err));
+    }
+  });
+  veil.addEventListener("click", (e) => {
+    if (e.target === veil) dismiss();
+  });
+  document.body.appendChild(veil);
+}
+
+(async function maybeAutoStartCall() {
+  const params = new URLSearchParams(location.search);
+  if (params.get("call") !== "1") return;
+  // Drop the flag so a refresh does not redial.
+  history.replaceState(null, "", location.pathname);
+  try {
+    await startCallFlow();
+  } catch (err) {
+    console.warn("Auto-call failed, asking for a tap", err);
+    showTapToCall();
+  }
+})();

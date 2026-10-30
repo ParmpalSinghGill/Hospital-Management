@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from hospital_graph import build_graph
-from hospital_routing import _sticky_route_from_history
+from reception_graph import build_graph
+from reception_routing import _sticky_route_from_history
 
 
 def test_compiled_graph_has_expected_nodes():

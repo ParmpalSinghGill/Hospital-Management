@@ -13,7 +13,7 @@ def isolated_db(tmp_path, monkeypatch):
 
     dataset = tmp_path / "dataset"
     dataset.mkdir()
-    db_path = dataset / "hospital.db"
+    db_path = dataset / "reception.db"
 
     monkeypatch.setattr(db_core, "DATASET_DIR", str(dataset))
     monkeypatch.setattr(db_core, "DB_PATH", str(db_path))

@@ -6,13 +6,14 @@ admin_settings.json
 .admin_token_secret
 
 # --- Runtime data ---
-dataset/hospital.db
-dataset/hospital.db-*
+dataset/reception.db
+dataset/reception.db-*
 dataset/*.json
 chats/
 metrics/
 app.log
 *.log
+.discord_bot.lock
 
 # --- Python ---
 __pycache__/

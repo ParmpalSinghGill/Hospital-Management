@@ -153,7 +153,7 @@
   try {
     const data = await api(`/admin/api/patients/${encodeURIComponent(patientId)}`);
     const p = data.patient || {};
-    document.title = `DBC Care — ${p.name || patientId}`;
+    document.title = `ReceptionAi — ${p.name || patientId}`;
     document.getElementById("patient-name").textContent = p.name || "Patient";
     const idLink = document.getElementById("patient-id-link");
     idLink.textContent = p.patient_id || patientId;
