@@ -4,6 +4,8 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from speculation import hold_side_effects
+
 from database import (
     _complete_past_appointments_for_patient,
     _enrich_appointment,
@@ -203,6 +205,7 @@ def save_patient(
     address: str = "",
 ) -> str:
     """Create or update a patient record after phone and name are confirmed."""
+    hold_side_effects()  # speculative voice turns: wait until the turn is confirmed
     logging.info("save_patient %s %s", patient_name, phone)
     name = (patient_name or "").strip()
     ph = (phone or "").strip()

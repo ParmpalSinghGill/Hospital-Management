@@ -389,8 +389,14 @@ def _get_doctor_by_name(name: str) -> Optional[Dict[str, str]]:
 def _get_doctor_by_id(doctor_id: str) -> Optional[Dict[str, str]]:
     target = (doctor_id or "").strip().upper()
     with _db() as conn:
+        # Indexed exact match first; upper(...) scan only as a fallback.
         row = conn.execute(
-            "SELECT doctor_id, name, department FROM doctors WHERE upper(doctor_id)=?",
+            "SELECT doctor_id, name, department FROM doctors WHERE doctor_id=?",
             (target,),
         ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT doctor_id, name, department FROM doctors WHERE upper(doctor_id)=?",
+                (target,),
+            ).fetchone()
     return _row_to_dict(row) if row else None

@@ -41,6 +41,17 @@ _LC_TOOLS = {
     "get_prescriptions": get_prescriptions,
 }
 
+# Speculative turns run on a scratch copy of the conversation; when a guess is
+# kept, that copy becomes the conversation. Calls in the same browser window
+# reuse the original thread_id, so map it to whichever thread is current.
+_THREAD_ALIAS: dict[str, str] = {}
+
+
+def resolve_thread_id(thread_id: str) -> str:
+    """The LangGraph thread currently holding ``thread_id``'s conversation."""
+    return _THREAD_ALIAS.get(thread_id, thread_id)
+
+
 # One shared LangGraph + checkpointer for the whole bot process so the same
 # browser conversation (thread_id) keeps memory across call reconnects.
 _SHARED_GRAPH = None
@@ -252,10 +263,23 @@ def make_langgraph_processor(
     *,
     call_id: str | None = None,
     shared_state: dict[str, Any] | None = None,
+    speculation: str | None = None,
+    turn_text: Any = None,
 ):
-    """Pipecat FrameProcessor that runs Main.py LangGraph each user turn."""
+    """Pipecat FrameProcessor that runs Main.py LangGraph each user turn.
+
+    ``speculation``: ``None`` (off), ``"vad"`` (guess at each VAD pause using
+    ``turn_text``, the transcript tap's running copy) or ``"external"`` (guess
+    on the STT's own early end-of-turn signal — Deepgram Flux). See
+    ``speculation.py`` for why a wrong guess is harmless.
+    """
     import time
-    from dataclasses import dataclass
+    import uuid
+    from dataclasses import dataclass, field
+
+    from speculation import SpeculationGate, normalize_utterance, speculation_gate
+    from speculation_stats import record_guess, utc_now
+    from tool_progress import filler_for_tool
 
     from pipecat.frames.frames import (
         Frame,
@@ -265,11 +289,29 @@ def make_langgraph_processor(
         OutputTransportMessageUrgentFrame,
         TTSSpeakFrame,
         UninterruptibleFrame,
+        VADUserStartedSpeakingFrame,
+        VADUserStoppedSpeakingFrame,
     )
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     log_call_id = call_id or thread_id
+    base_thread_id = thread_id
     state = shared_state if shared_state is not None else {}
+
+    @dataclass(eq=False)
+    class _Speculation:
+        """A LangGraph run started on an early end-of-turn signal."""
+
+        text: str
+        norm: str
+        thread_id: str
+        started_at: float
+        gate: SpeculationGate
+        logs: list = field(default_factory=list)
+        task: asyncio.Task | None = None
+        started_wall: Any = None
+        done_at: float | None = None  # guessed run finished (monotonic)
+        committed_at: float | None = None  # turn committed with matching words
 
     # Keep reply text/audio in the queue if an InterruptionFrame arrives mid-push.
     @dataclass
@@ -293,6 +335,9 @@ def make_langgraph_processor(
             self._pending_user_text = ""
             self._phone_buffer = ""
             self._phone_flush_task: asyncio.Task | None = None
+            self._thread_id = resolve_thread_id(base_thread_id)
+            self._speculation: _Speculation | None = None
+            self._spec_armed = False
 
         def _cancel_phone_flush(self) -> None:
             task = self._phone_flush_task
@@ -317,13 +362,118 @@ def make_langgraph_processor(
             except Exception:
                 pass
 
-        def _start_turn(self, user_text: str, direction: FrameDirection) -> None:
+        def _start_turn(
+            self,
+            user_text: str,
+            direction: FrameDirection,
+            spec: "_Speculation | None" = None,
+        ) -> None:
             self._busy = True
             state["busy"] = True
             self.create_task(
-                self._drain_turns(user_text, direction),
+                self._drain_turns(user_text, direction, spec),
                 name="reception_langgraph_turn",
             )
+
+        # ── speculation ─────────────────────────────────────────────────
+
+        def _may_speculate(self) -> bool:
+            if speculation is None or self._busy:
+                return False
+            # A caller reading out a number pauses between digit groups on
+            # purpose; the phone buffer owns those pauses.
+            return not bot_awaiting_phone(str(state.get("last_bot_text") or ""))
+
+        def _speculate(self, text: str) -> None:
+            """Start (or restart) a guess on ``text`` before the turn commits."""
+            text = (text or "").strip()
+            if not text or not self._may_speculate():
+                return
+            norm = normalize_utterance(text)
+            current = self._speculation
+            if current is not None and current.norm == norm:
+                return
+            if current is not None:
+                self._abandon(current, reason="text_changed")
+
+            spec = _Speculation(
+                text=text,
+                norm=norm,
+                thread_id=f"{base_thread_id}~spec-{uuid.uuid4().hex[:8]}",
+                started_at=time.monotonic(),
+                gate=SpeculationGate(call_id=log_call_id),
+                started_wall=utc_now(),
+            )
+            main_thread = self._thread_id
+
+            def _snapshot() -> dict:
+                try:
+                    snap = graph_app.get_state({"configurable": {"thread_id": main_thread}})
+                    return dict(getattr(snap, "values", None) or {})
+                except Exception:
+                    return {}
+
+            async def run():
+                # Set inside the task so only this run (and the threads it
+                # spawns) sees the gate.
+                speculation_gate.set(spec.gate)
+                seed = await asyncio.to_thread(_snapshot)
+                return await asyncio.to_thread(
+                    run_turn,
+                    graph_app,
+                    text,
+                    spec.thread_id,
+                    call_id=log_call_id,
+                    seed_state=seed,
+                    deferred_logs=spec.logs,
+                )
+
+            spec.task = asyncio.get_running_loop().create_task(run())
+            spec.task.add_done_callback(lambda _t, s=spec: setattr(s, "done_at", time.monotonic()))
+            self._speculation = spec
+            logger.info(f"Speculative turn started ({spec.thread_id}): {text!r}")
+
+        def _abandon(self, spec: "_Speculation", *, reason: str) -> None:
+            """Drop a guess: release held writes as refused, discard its thread.
+
+            The run is not cancelled — it is in a worker thread, and
+            cancelling the awaiting task would not stop it. It finishes on its
+            own scratch thread, which is then deleted.
+            """
+            if self._speculation is spec:
+                self._speculation = None
+            spec.gate.abandon()
+            logger.info(f"Speculative turn abandoned ({reason}): {spec.text!r}")
+
+            def _cleanup(task: asyncio.Task) -> None:
+                if not task.cancelled():
+                    task.exception()  # mark retrieved; a refused write raises
+                # Counted only now: a dropped guess keeps running (and paying
+                # for LLM calls) until it finishes.
+                self._record_guess(spec, "miss", reason=reason)
+                try:
+                    graph_app.checkpointer.delete_thread(spec.thread_id)
+                except Exception:
+                    pass
+
+            if spec.task is not None:
+                spec.task.add_done_callback(_cleanup)
+
+        async def on_transcript_update(self) -> None:
+            """Transcript tap saw new words; re-guess if a VAD pause is open."""
+            if speculation == "vad" and self._spec_armed and turn_text is not None:
+                self._speculate(turn_text.text)
+
+        async def on_early_end_of_turn(self, transcript: str) -> None:
+            """Deepgram Flux's early end-of-turn guess (EagerEndOfTurn)."""
+            if speculation == "external":
+                self._speculate(transcript)
+
+        async def on_turn_resumed(self) -> None:
+            """The caller kept talking after an early end-of-turn guess."""
+            spec = self._speculation
+            if spec is not None:
+                self._abandon(spec, reason="resumed")
 
         async def _flush_phone_buffer(self, direction: FrameDirection) -> None:
             """After a short pause, send buffered digit fragments as one turn."""
@@ -402,23 +552,125 @@ def make_langgraph_processor(
                 direction,
             )
 
-        async def _run_one_turn(self, user_text: str, direction: FrameDirection) -> None:
+        async def _push_tool_filler(self, phrase: str, direction: FrameDirection) -> None:
+            """Speak a short "Let me check…" while a tool and the follow-up LLM call run.
+
+            Interruptible on purpose (unlike the real reply): if the caller
+            starts talking again, dropping the filler is fine. Not added to the
+            LLM context or to ``last_bot_text``.
+            """
+            await self.push_frame(
+                OutputTransportMessageUrgentFrame(
+                    message={
+                        "label": "rtvi-ai",
+                        "type": "server-message",
+                        "data": {"type": "bot_filler_text", "text": phrase},
+                    }
+                ),
+                direction,
+            )
+            frame = TTSSpeakFrame(text=phrase, append_to_context=False)
+            # turn_metrics.py keys on this so the filler isn't timed as the reply.
+            frame.tool_filler = True
+            await self.push_frame(frame, direction)
+
+        def _tool_filler_hook(self, direction: FrameDirection):
+            """Per-turn ``on_tool_start`` hook; speaks at most one filler per turn.
+
+            Called from LangGraph's worker thread, so it hands off to the loop.
+            Returns ``(hook, futures)``; await the futures before the real reply
+            so the filler can never land after it.
+            """
+            loop = asyncio.get_running_loop()
+            futures: list = []
+
+            def hook(tool_name: str) -> None:
+                if futures:
+                    return
+                phrase = filler_for_tool(tool_name)
+                logger.info(f"Tool {tool_name!r} started — filler: {phrase!r}")
+                futures.append(
+                    asyncio.run_coroutine_threadsafe(
+                        self._push_tool_filler(phrase, direction), loop
+                    )
+                )
+
+            return hook, futures
+
+        def _record_guess(self, spec: "_Speculation", outcome: str, *, reason: str = "") -> None:
+            try:
+                record_guess(
+                    log_call_id,
+                    outcome=outcome,
+                    reason=reason,
+                    text=spec.text,
+                    started_wall=spec.started_wall or utc_now(),
+                    started_at=spec.started_at,
+                    done_at=spec.done_at or time.monotonic(),
+                    committed_at=spec.committed_at,
+                    llm_calls=spec.gate.llm_calls,
+                    llm_ms=spec.gate.llm_ms,
+                )
+            except Exception:
+                logger.exception("speculation stats failed")
+
+        async def _await_speculation(self, spec: "_Speculation"):
+            """Confirm a guess and take its result, or ``None`` if it failed."""
+            if spec.committed_at is None:
+                spec.committed_at = time.monotonic()
+            spec.gate.confirm()
+            try:
+                result = await spec.task
+            except BaseException as e:  # noqa: BLE001 - fall back to a normal run
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                logger.warning(f"Speculative turn failed, rerunning: {e!r}")
+                self._record_guess(spec, "failed", reason="error")
+                return None
+            self._record_guess(spec, "hit")
+            for log_fn in spec.logs:
+                try:
+                    log_fn()
+                except Exception:
+                    logger.exception("Deferred call-log write failed")
+            # The scratch copy is now the conversation.
+            _THREAD_ALIAS[base_thread_id] = spec.thread_id
+            self._thread_id = spec.thread_id
+            saved_ms = round((time.monotonic() - spec.started_at) * 1000)
+            logger.info(f"Speculative turn hit ({spec.thread_id}), started {saved_ms}ms ago")
+            return result
+
+        async def _run_one_turn(
+            self,
+            user_text: str,
+            direction: FrameDirection,
+            spec: "_Speculation | None" = None,
+        ) -> None:
             now = time.monotonic()
             self._last_user_text = user_text
             self._last_user_at = now
             state["last_user_text"] = user_text
             state["busy"] = True
-            logger.info(f"LangGraph turn ({thread_id}): {user_text!r}")
-            # Run inference off the process-frame task. If we await here inside
-            # process_frame and swallow CancelledError, Pipecat's barge-in waits
-            # forever for the process task to exit → dead silence.
-            turn_result = await asyncio.to_thread(
-                run_turn,
-                graph_app,
-                user_text,
-                thread_id,
-                call_id=log_call_id,
-            )
+            turn_result = await self._await_speculation(spec) if spec is not None else None
+            if turn_result is None:
+                logger.info(f"LangGraph turn ({self._thread_id}): {user_text!r}")
+                # Run inference off the process-frame task. If we await here inside
+                # process_frame and swallow CancelledError, Pipecat's barge-in waits
+                # forever for the process task to exit → dead silence.
+                hook, filler_futures = self._tool_filler_hook(direction)
+                turn_result = await asyncio.to_thread(
+                    run_turn,
+                    graph_app,
+                    user_text,
+                    self._thread_id,
+                    call_id=log_call_id,
+                    on_tool_start=hook,
+                )
+                for fut in filler_futures:
+                    try:
+                        await asyncio.wrap_future(fut)
+                    except Exception:
+                        logger.exception("Tool filler failed")
             reply = getattr(turn_result, "text", None) or str(turn_result or "")
             agent = getattr(turn_result, "agent", "") or ""
             reply = sanitize_assistant_reply(reply or "")
@@ -430,13 +682,20 @@ def make_langgraph_processor(
                 logger.info(f"LangGraph reply: {reply!r}")
             await self._push_spoken_reply(reply, direction)
 
-        async def _drain_turns(self, first_text: str, direction: FrameDirection) -> None:
+        async def _drain_turns(
+            self,
+            first_text: str,
+            direction: FrameDirection,
+            spec: "_Speculation | None" = None,
+        ) -> None:
             """Background turn loop — must not run on Pipecat's process-frame task."""
             try:
                 next_text = first_text
                 while next_text:
                     try:
-                        await self._run_one_turn(next_text, direction)
+                        # A guess belongs to the first turn only.
+                        first_spec, spec = spec, None
+                        await self._run_one_turn(next_text, direction, first_spec)
                     except Exception as e:
                         logger.exception("LangGraph turn failed")
                         err = f"Sorry, something went wrong: {e}"
@@ -461,9 +720,31 @@ def make_langgraph_processor(
         async def process_frame(self, frame: Frame, direction: FrameDirection):
             await super().process_frame(frame, direction)
 
+            # VAD's pause is the early signal; speech resuming cancels the guess.
+            if speculation == "vad":
+                if isinstance(frame, VADUserStoppedSpeakingFrame):
+                    self._spec_armed = True
+                    if turn_text is not None:
+                        self._speculate(turn_text.text)
+                elif isinstance(frame, VADUserStartedSpeakingFrame):
+                    self._spec_armed = False
+                    if self._speculation is not None:
+                        self._abandon(self._speculation, reason="resumed")
+
             if isinstance(frame, LLMContextFrame):
+                self._spec_armed = False
+                if turn_text is not None:
+                    turn_text.reset()
+                spec = self._speculation
+                self._speculation = None
+
+                def _drop(reason: str) -> None:
+                    if spec is not None:
+                        self._abandon(spec, reason=reason)
+
                 user_text = _last_user_text(frame.context)
                 if not user_text:
+                    _drop("empty_commit")
                     # Do not block waiting for STT — that open cancel window
                     # was dropping later turns and killing voice.
                     await self.push_frame(frame, direction)
@@ -474,11 +755,13 @@ def make_langgraph_processor(
                     user_text == self._last_user_text
                     and (now - self._last_user_at) < 2.0
                 ):
+                    _drop("duplicate_commit")
                     logger.debug(f"Skipping duplicate LangGraph turn: {user_text!r}")
                     return
 
                 awaiting = bot_awaiting_phone(str(state.get("last_bot_text") or ""))
                 if awaiting and looks_like_phone_fragment(user_text):
+                    _drop("phone_fragment")
                     if self._busy:
                         self._queue_while_busy(user_text)
                     else:
@@ -493,12 +776,20 @@ def make_langgraph_processor(
                     logger.info(f"Flushing phone buffer with follow-up: {user_text!r}")
 
                 if self._busy:
+                    _drop("busy")
                     self._queue_while_busy(user_text)
                     return
 
+                if spec is not None and spec.norm != normalize_utterance(user_text):
+                    # The caller said more after the pause, or STT revised it.
+                    _drop("text_mismatch")
+                    spec = None
+
+                if spec is not None:
+                    spec.committed_at = now
                 # Return immediately so barge-in can cancel/recreate the process
                 # task while LangGraph keeps running in the background.
-                self._start_turn(user_text, direction)
+                self._start_turn(user_text, direction, spec)
                 return
 
             await self.push_frame(frame, direction)

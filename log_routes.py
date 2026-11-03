@@ -37,6 +37,11 @@ class EventBody(BaseModel):
     at_ms: float | None = None
     voice_start_at_ms: float | None = None
     voice_end_at_ms: float | None = None
+    # Per-turn latency from the browser (bot_text_first_shown / bot_voice_first_heard).
+    # Without these fields pydantic dropped them and Admin "Response timing" stayed empty.
+    latency_ms: float | None = None
+    first_text: str | None = None
+    first_speech: str | None = None
 
 
 class EndBody(BaseModel):

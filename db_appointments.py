@@ -537,6 +537,77 @@ def _enrich_appointment(appt: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _enrich_appointments(
+    appts: List[Dict[str, Any]], *, with_patients: bool = True
+) -> List[Dict[str, Any]]:
+    """Batch ``_enrich_appointment``: one patients query + one doctors query.
+
+    Per-row enrichment opens two DB connections per appointment, which made
+    the admin list take ~50 s at 15k appointments. ``with_patients=False``
+    fills only doctor/department (cheap) — enough to filter and sort before
+    paging, then enrich just the page.
+    """
+    if not appts:
+        return []
+    pids = sorted({str(a.get("patient_id") or "").strip().upper() for a in appts} - {""})
+    if not with_patients:
+        pids = []
+    patients: Dict[str, Dict[str, Any]] = {}
+    with _db() as conn:
+        for i in range(0, len(pids), 500):  # stay under SQLite's variable limit
+            chunk = pids[i : i + 500]
+            rows = conn.execute(
+                "SELECT patient_id, name, phone FROM patients WHERE patient_id IN "
+                f"({','.join('?' * len(chunk))})",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                patients[str(r["patient_id"]).upper()] = dict(r)
+    doctors = _load_doctors()
+    by_id = {str(d.get("doctor_id") or "").upper(): d for d in doctors}
+    by_name = {_normalize_doctor_name(d.get("name", "")): d for d in doctors}
+
+    out_rows: List[Dict[str, Any]] = []
+    for appt in appts:
+        out = dict(appt)
+        pid = str(appt.get("patient_id") or "").strip().upper()
+        patient = patients.get(pid) if with_patients else None
+        if patient is None and pid and with_patients:
+            patient = _get_patient_by_id(pid)  # odd-case legacy id
+        if patient:
+            out["patient_name"] = patient.get("name", "")
+            out["patient_phone"] = patient.get("phone", "")
+        doctor = None
+        if appt.get("doctor_id"):
+            doctor = by_id.get(str(appt.get("doctor_id")).strip().upper())
+        if doctor is None and appt.get("doctor"):
+            doctor = by_name.get(_normalize_doctor_name(str(appt.get("doctor"))))
+        if doctor:
+            out["doctor"] = doctor.get("name", out.get("doctor", ""))
+            out["doctor_id"] = doctor.get("doctor_id", out.get("doctor_id", ""))
+            out["department"] = doctor.get("department", out.get("department", ""))
+        out_rows.append(out)
+    return out_rows
+
+
+def delete_appointments_before(day: str, *, dry_run: bool = False) -> int:
+    """Delete every appointment (any status) dated before ``day`` (YYYY-MM-DD).
+
+    ``day`` itself is kept: ``before="2026-11-02"`` removes up to 2026-11-01
+    23:59. Times are stored as ``YYYY-MM-DD HH:MM``, so a string compare on the
+    date is exact. ``dry_run`` returns the count without deleting.
+    """
+    key = (day or "").strip()[:10]
+    datetime.strptime(key, "%Y-%m-%d")  # ValueError on a bad date
+    with _appointment_write_lock:
+        with _db() as conn:
+            where = "WHERE substr(time, 1, 10) < ? AND time GLOB '[0-9][0-9][0-9][0-9]-*'"
+            if dry_run:
+                return int(conn.execute(f"SELECT count(*) FROM appointments {where}", (key,)).fetchone()[0])
+            cur = conn.execute(f"DELETE FROM appointments {where}", (key,))
+            return int(cur.rowcount or 0)
+
+
 def _find_active_appointment_for_patient(
     patient_id: str,
     appts: Optional[List[Dict[str, Any]]] = None,

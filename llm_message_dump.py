@@ -487,7 +487,13 @@ def llm_dump_callbacks(node: str = "") -> list[Any]:
 def agent_invoke_config(node: str, *, recursion_limit: int) -> dict[str, Any]:
     """Config dict for agent.invoke with optional LLM dump callbacks."""
     cfg: dict[str, Any] = {"recursion_limit": recursion_limit}
-    cbs = llm_dump_callbacks(node)
+    cbs = list(llm_dump_callbacks(node) or [])
+    try:
+        from tool_progress import tool_start_callbacks
+
+        cbs.extend(tool_start_callbacks())
+    except Exception:
+        pass
     if cbs:
         cfg["callbacks"] = cbs
     return cfg

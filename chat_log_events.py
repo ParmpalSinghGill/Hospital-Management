@@ -7,6 +7,18 @@ from typing import Any
 import chat_log_core as core
 
 
+def join_utterance(prev: str, nxt: str) -> str:
+    """Join two speech fragments into one message, skipping repeats."""
+    a, b = (prev or "").strip(), (nxt or "").strip()
+    if not a:
+        return b
+    if not b or a.endswith(b):
+        return a
+    if b.startswith(a):
+        return b
+    return f"{a} {b}"
+
+
 def record_timeline_event(
     call_id: str,
     *,
@@ -179,11 +191,16 @@ def apply_client_event(call_id: str, event: dict[str, Any]) -> dict[str, Any]:
             data = core._read(path) or {}
             interactions = _interactions(data)
             if interactions:
-                last_user = str(
-                    ((interactions[-1].get("payload") or {}).get("user_input_text") or "")
-                ).strip()
+                payload = interactions[-1].get("payload") or {}
+                last_user = str(payload.get("user_input_text") or "").strip()
+                last_bot = str(payload.get("bot_response_text") or "").strip()
                 if last_user == text:
                     new_turn = False
+                elif last_user and not last_bot:
+                    # Caller paused mid-sentence: STT sent another final before
+                    # the bot replied. Grow the same message, don't add one.
+                    new_turn = False
+                    text = join_utterance(last_user, text)
         patch.update(
             {
                 "input_type": "voice",

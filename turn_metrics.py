@@ -31,12 +31,14 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
+    TTSSpeakFrame,
     TTSStartedFrame,
     UserStoppedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.processors.frame_processor import FrameDirection
 
+import llm_timing
 from session_turn import set_last_user_message
 
 DEFAULT_CSV_PATH = Path(__file__).parent / "metrics" / "bot_messages.csv"
@@ -61,6 +63,12 @@ CSV_HEADER = [
     "tts_first_audio_ms",
     "first_audio_heard_ms",
     "audio_complete_ms",
+    # Bottleneck breakdown, all from turn start (user stopped / text sent).
+    # T1–T4 come from the LLM HTTP calls (llm_timing.py); T5 is first TTS audio.
+    *llm_timing.TURN_COLUMNS,
+    "t5_first_audio_byte_ms",
+    # "Let me check…" filler spoken while a tool runs (voice_bridge.py).
+    "filler_audio_heard_ms",
 ]
 
 
@@ -129,6 +137,10 @@ class _ActiveTurn:
 
     llm_segment_had_text: bool = False
     awaiting_user_text: bool = False
+
+    # Tool filler: its audio must not be timed as the reply's.
+    filler_used: bool = False
+    filler_heard_mono: float | None = None
 
 
 class TurnMetricsObserver(BaseObserver):
@@ -225,6 +237,11 @@ class TurnMetricsObserver(BaseObserver):
         turn.t6_mono = time.perf_counter()
         turn.t6_wall = _utc_now()
 
+    def _filler_audio(self) -> bool:
+        """True while the only speech this turn is the tool filler."""
+        turn = self._turn
+        return turn is not None and turn.filler_used and turn.t2_mono is None
+
     def _commit_if_ready(self, *, text_only: bool = False) -> None:
         turn = self._turn
         if turn is None:
@@ -242,6 +259,10 @@ class TurnMetricsObserver(BaseObserver):
             self._turn = None
 
     def _write_row(self, turn: _ActiveTurn) -> None:
+        # Reply audio queued right behind the filler plays without a new
+        # BotStartedSpeaking; first reply audio byte is the closest stamp.
+        if turn.filler_used and turn.t5_mono is None and turn.t4_mono is not None:
+            turn.t5_mono, turn.t5_wall = turn.t4_mono, turn.t4_wall
         t1_base = turn.t1_mono if turn.t1_mono is not None else turn.t0_mono
         row = {
             "session_id": turn.session_id,
@@ -260,6 +281,9 @@ class TurnMetricsObserver(BaseObserver):
             "tts_first_audio_ms": _delta_ms(turn.t3_mono, turn.t4_mono),
             "first_audio_heard_ms": _delta_ms(turn.t0_mono, turn.t5_mono),
             "audio_complete_ms": _delta_ms(turn.t0_mono, turn.t6_mono),
+            **llm_timing.summarize_turn(llm_timing.drain(turn.session_id), turn.t0_mono),
+            "t5_first_audio_byte_ms": _delta_ms(turn.t0_mono, turn.t4_mono),
+            "filler_audio_heard_ms": _delta_ms(turn.t0_mono, turn.filler_heard_mono),
         }
 
         BOT_METRICS_CSV.parent.mkdir(parents=True, exist_ok=True)
@@ -308,6 +332,14 @@ class TurnMetricsObserver(BaseObserver):
                     "first_audio_heard_ms": row["first_audio_heard_ms"],
                     "audio_complete_ms": row["audio_complete_ms"],
                     "tts_started_at": _iso(turn.t4_wall),
+                    **{
+                        k: row[k]
+                        for k in (
+                            *llm_timing.TURN_COLUMNS,
+                            "t5_first_audio_byte_ms",
+                            "filler_audio_heard_ms",
+                        )
+                    },
                 },
             )
         except Exception as e:
@@ -318,7 +350,10 @@ class TurnMetricsObserver(BaseObserver):
             f"stt={row['stt_latency_ms']}ms "
             f"ttft={row['llm_ttft_ms']}ms "
             f"text={row['full_text_response_ms']}ms "
-            f"voice={row['first_audio_heard_ms']}ms"
+            f"voice={row['first_audio_heard_ms']}ms "
+            f"| llm_calls={row['llm_calls']} T1={row['t1_llm_request_ms']} "
+            f"T2={row['t2_llm_first_byte_ms']} T3={row['t3_llm_first_token_ms']} "
+            f"T4={row['t4_llm_last_token_ms']} T5={row['t5_first_audio_byte_ms']}"
         )
 
     def _update_user_text(self, text: str, *, final: bool) -> None:
@@ -395,19 +430,40 @@ class TurnMetricsObserver(BaseObserver):
             turn.llm_segment_had_text = False
             return
 
-        if isinstance(frame, TTSStartedFrame):
-            self._mark_tts_first_audio()
+        # Cascade replies arrive whole as one TTSSpeakFrame (voice_bridge no
+        # longer pushes LLMTextFrame), so that frame is first token + full text.
+        # Without this no cascade row was written after 2026-07-22.
+        if isinstance(frame, TTSSpeakFrame):
+            turn = self._turn
+            if getattr(frame, "tool_filler", False):
+                if turn is not None:
+                    turn.filler_used = True
+                return
+            if turn is not None and (frame.text or "").strip():
+                turn.bot_text = (frame.text or "").strip()
+                self._mark_llm_first_token()
+                self._mark_full_text()
             return
 
-        if isinstance(frame, TTSAudioRawFrame):
-            self._mark_tts_first_audio()
+        if isinstance(frame, (TTSStartedFrame, TTSAudioRawFrame)):
+            if not self._filler_audio():
+                self._mark_tts_first_audio()
             return
 
         if isinstance(frame, BotStartedSpeakingFrame):
+            if self._filler_audio():
+                turn = self._turn
+                if turn.filler_heard_mono is None:
+                    turn.filler_heard_mono = time.perf_counter()
+                return
             self._mark_first_audio_heard()
             return
 
         if isinstance(frame, BotStoppedSpeakingFrame):
+            turn = self._turn
+            # Filler finished before the reply's audio exists — not the end.
+            if turn is not None and turn.filler_used and turn.t4_mono is None:
+                return
             self._mark_audio_complete()
             self._commit_if_ready(text_only=False)
             return

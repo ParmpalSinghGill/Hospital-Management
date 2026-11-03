@@ -52,6 +52,19 @@ def _avg(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 1)
 
 
+def _ms_between(start: Any, end: Any) -> float | None:
+    """Milliseconds between two ISO timestamps, or None if missing / implausible."""
+    from datetime import datetime
+
+    try:
+        a = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        b = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    ms = (b - a).total_seconds() * 1000
+    return ms if 0 < ms < 60_000 else None
+
+
 def _timing_samples_from_interactions(
     interactions: list[dict[str, Any]],
 ) -> tuple[list[float], list[float]]:
@@ -62,9 +75,20 @@ def _timing_samples_from_interactions(
             continue
         timings = ix.get("client_timings")
         if not isinstance(timings, dict):
-            continue
+            timings = {}
         raw_text = timings.get("first_text_latency_ms")
         raw_audio = timings.get("first_audio_latency_ms")
+        # Older turns lost latency_ms (see log_routes.EventBody); estimate it from
+        # the browser timestamps the turn did keep.
+        stamps = ix.get("timestamps") if isinstance(ix.get("timestamps"), dict) else {}
+        if raw_text is None:
+            raw_text = _ms_between(
+                stamps.get("user_sent_time"), stamps.get("first_token_visible_to_user")
+            )
+        if raw_audio is None:
+            raw_audio = _ms_between(
+                stamps.get("user_sent_time"), stamps.get("first_audio_heard_by_user")
+            )
         try:
             if raw_text is not None:
                 text_samples.append(float(raw_text))
@@ -127,11 +151,16 @@ def summarize_response_timings(*, include_sessions: bool = False) -> dict[str, A
     sessions_with_audio = 0
     session_count = 0
     turn_count = 0
+    demo_session_count = 0
     per_session: list[dict[str, Any]] = []
 
     for path in _iter_chat_files():
         data = core._read(path)
         if not data:
+            continue
+        # Demo conversations from MakeDataBase are not real traffic.
+        if _is_seed_chat(data, path_name=path.name):
+            demo_session_count += 1
             continue
         session_count += 1
         uid = str(data.get("user_id") or "").strip()
@@ -176,6 +205,7 @@ def summarize_response_timings(*, include_sessions: bool = False) -> dict[str, A
         "session_count": session_count,
         "turn_count": turn_count,
         "user_count": len(user_ids),
+        "demo_session_count": demo_session_count,
         "first_text": _bucket(text_samples, sessions_with_text),
         "first_speech": _bucket(audio_samples, sessions_with_audio),
     }

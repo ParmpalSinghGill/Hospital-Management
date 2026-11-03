@@ -34,6 +34,33 @@ Full step-by-step guides (what to run + how to interact) live in **[`MD/`](MD/RE
 | Change industry / providers / LLM | [Admin](MD/admin.md) | open `/admin/` after `bot.py` |
 | Seed / clear demo data | [Database](MD/database.md) | `python MakeDataBase.py …` |
 
+### Voice turn-taking (Admin → Settings)
+
+How a cascade call decides the caller has finished speaking ([turn_detection.py](turn_detection.py)):
+
+| Setting | What it does |
+|---------|--------------|
+| **End-of-turn method** | `Silence timeout` (default) · `Smart Turn v3` (local audio model) · `VAP` (needs PyTorch + `python setup_vap.py`) · `Deepgram Flux` (STT's own end-of-turn) |
+| **Silence before reply** | Silence that ends the turn for *Silence timeout* (0.1–3.0s). Try 0.5 if callers get cut off. |
+| **Max pause for model methods** | Smart Turn / VAP / Flux end the turn after this pause even if the model says "not finished" (0.3–5.0s). |
+| **Voice speculative** | Starts the reply at the first pause on a copy of the conversation; kept only if the final words match. Booking / cancel / reschedule / save-patient wait for confirmation ([speculation.py](speculation.py)). Costs extra LLM calls. |
+
+Changes apply on the next call. A method that can't run on this machine is greyed out, and falls back to *Silence timeout* if set by env (`VOICE_TURN_DETECTOR`).
+
+### Landing page (`web/`)
+
+http://localhost:7860/ serves the marketing landing page, a static Next.js export in [`web/`](web/). Its **Request a call** buttons open `/app/?call=1` (auto-dials) and **Try the chat instead** opens `/app/`. Admin is not linked from the page; open `/admin/` directly.
+
+Build it once (and again after editing anything in `web/`), then restart `bot.py`:
+
+```bash
+cd web
+npm install --no-bin-links        # repo is on NTFS: no symlinks
+node node_modules/next/dist/bin/next build   # writes web/out/
+```
+
+If `web/out/` is missing, `/` falls back to the older Python-rendered `landing.py` page.
+
 You can run several channels at once (separate terminals). They all share `Tools.py`, `dataset/reception.db` and the active industry profile.
 
 ---

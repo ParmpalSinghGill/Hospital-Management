@@ -95,3 +95,63 @@ def test_cancel_via_update(isolated_db):
     appt["status"] = "CANCELLED"
     db_appointments._update_appointment(appt)
     assert db_appointments._find_active_appointment_for_patient(appt["patient_id"]) is None
+
+
+def _insert_appts(rows):
+    from db_core import _db
+
+    with _db() as conn:
+        conn.executemany(
+            "INSERT INTO appointments(appointment_id, patient_id, doctor_id, doctor, department, time, status)"
+            " VALUES (?,?,?,?,?,?,?)",
+            rows,
+        )
+
+
+def test_delete_appointments_before_keeps_that_day(isolated_db):
+    import pytest
+
+    from db_appointments import _load_all_appointments, delete_appointments_before
+
+    _insert_appts(
+        [
+            ("APT-9001", "PAT-1", "DOC-0001", "", "", "2026-10-31 10:00", "BOOKED"),
+            ("APT-9002", "PAT-1", "DOC-0001", "", "", "2026-11-01 23:50", "CANCELLED"),
+            ("APT-9003", "PAT-1", "DOC-0001", "", "", "2026-11-02 00:00", "BOOKED"),
+            ("APT-9004", "PAT-1", "DOC-0001", "", "", "2026-11-05 09:00", "BOOKED"),
+        ]
+    )
+    assert delete_appointments_before("2026-11-02", dry_run=True) == 2
+    assert len(_load_all_appointments()) == 4  # dry run deletes nothing
+    assert delete_appointments_before("2026-11-02") == 2
+    assert sorted(a["appointment_id"] for a in _load_all_appointments()) == ["APT-9003", "APT-9004"]
+    with pytest.raises(ValueError):
+        delete_appointments_before("not-a-date")
+
+
+def test_admin_appointments_paging_and_sort(isolated_db):
+    import asyncio
+
+    import admin_routes
+
+    _insert_appts(
+        [(f"APT-8{i:03d}", "PAT-1", "DOC-0001", "", "", f"2026-01-{i + 1:02d} 10:00", "BOOKED") for i in range(7)]
+    )
+
+    def get(**kw):
+        args = dict(department=None, doctor_id=None, doctor=None, from_now=False,
+                    include_cancelled=False, sort="asc", page=1, page_size=3, admin_token="x")
+        args.update(kw)
+        return admin_routes.appointments(**args)
+
+    admin_routes_auth = admin_routes._require_auth
+    admin_routes._require_auth = lambda t: None
+    try:
+        r = get()
+        assert (r["count"], r["pages"], len(r["appointments"])) == (7, 3, 3)
+        assert r["appointments"][0]["time"] == "2026-01-01 10:00"
+        assert get(page=3)["appointments"][0]["time"] == "2026-01-07 10:00"
+        assert get(sort="desc")["appointments"][0]["time"] == "2026-01-07 10:00"
+        assert get(page=99)["page"] == 3  # clamped
+    finally:
+        admin_routes._require_auth = admin_routes_auth

@@ -26,6 +26,8 @@ from typing import Any, Optional
 
 import httpx
 
+import llm_timing
+
 log = logging.getLogger(__name__)
 
 _LOOP: asyncio.AbstractEventLoop | None = None
@@ -73,6 +75,8 @@ def async_http_client(http2: Optional[bool] = None) -> httpx.AsyncClient:
                 http2=h2,
                 timeout=httpx.Timeout(60.0, connect=10.0),
                 limits=httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=120),
+                # T1 (request sent) / T2 (first byte) per call — see llm_timing.py
+                event_hooks={"request": [llm_timing.on_request], "response": [llm_timing.on_response]},
             )
             _CLIENTS[h2] = client
         return client
@@ -126,19 +130,57 @@ class HedgedChatMixin:
     Concrete classes declare ``hedge_count`` / ``hedge_delay_ms`` pydantic fields.
     """
 
-    def _hedged(self, messages, stop, kwargs):
+    def _hedged(self, messages, stop, kwargs, scope=None, node: str = ""):
+        from langchain_core.language_models.chat_models import agenerate_from_stream
+
         parent_agenerate = super()._agenerate  # type: ignore[misc]
+        parent_astream = super()._astream  # type: ignore[misc]
+        model = str(getattr(self, "model_name", "") or getattr(self, "model", ""))
+        scope = scope or llm_timing.Scope()
+        stream = llm_timing.streaming_enabled()
+        copies = 0
+
+        async def timed_call():
+            # Runs as its own task: the timing ContextVar is private to this copy.
+            nonlocal copies
+            copies += 1
+            call, token = llm_timing.begin(scope, node=node, model=model, copy=copies)
+            try:
+                if stream:
+                    async def chunks():
+                        async for chunk in parent_astream(messages, stop=stop, run_manager=None, **kwargs):
+                            call.mark_chunk(chunk)
+                            yield chunk
+
+                    result = await agenerate_from_stream(chunks())
+                else:
+                    result = await parent_agenerate(messages, stop=stop, run_manager=None, **kwargs)
+                    call.mark_body(result)
+            except asyncio.CancelledError:
+                call.finish("cancelled")
+                raise
+            except BaseException:
+                call.finish("error")
+                raise
+            finally:
+                llm_timing.end(token)
+            call.finish("ok", result)
+            return result
+
         return _race(
-            lambda: parent_agenerate(messages, stop=stop, run_manager=None, **kwargs),
+            timed_call,
             self.hedge_count,  # type: ignore[attr-defined]
             self.hedge_delay_ms,  # type: ignore[attr-defined]
-            getattr(self, "model_name", "") or getattr(self, "model", ""),
+            model,
         )
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs: Any):
-        fut = asyncio.run_coroutine_threadsafe(self._hedged(messages, stop, kwargs), background_loop())
+        # Scope and node live in the caller's context; the loop thread can't see them.
+        coro = self._hedged(messages, stop, kwargs, llm_timing.current_scope(), llm_timing.current_node())
+        fut = asyncio.run_coroutine_threadsafe(coro, background_loop())
         return fut.result()
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs: Any):
-        fut = asyncio.run_coroutine_threadsafe(self._hedged(messages, stop, kwargs), background_loop())
+        coro = self._hedged(messages, stop, kwargs, llm_timing.current_scope(), llm_timing.current_node())
+        fut = asyncio.run_coroutine_threadsafe(coro, background_loop())
         return await asyncio.wrap_future(fut)

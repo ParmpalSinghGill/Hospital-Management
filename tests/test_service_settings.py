@@ -122,3 +122,36 @@ def test_vad_stop_secs_clamped_and_applied(settings_file, monkeypatch):
     assert saved["vad_stop_secs"] == 1.25
     assert ss.os.environ["VAD_STOP_SECS"] == "1.25"
     assert ss.load_settings()["vad_stop_secs"] == 1.25
+
+
+def test_turn_taking_defaults(settings_file):
+    s = ss.load_settings()
+    assert s["turn_detector"] == "silence"
+    assert s["max_silence_secs"] == 2.0
+    assert s["voice_speculative"] is False
+
+
+def test_turn_taking_saved_clamped_and_applied(settings_file, monkeypatch):
+    for key in ("VOICE_TURN_DETECTOR", "VOICE_SPECULATIVE", "VOICE_MAX_SILENCE_SECS"):
+        monkeypatch.delenv(key, raising=False)
+    saved = ss.save_settings(
+        {"turn_detector": "smart_turn", "max_silence_secs": 99, "voice_speculative": True}
+    )
+    assert saved["turn_detector"] == "smart_turn"
+    assert saved["max_silence_secs"] == 5.0
+    assert saved["voice_speculative"] is True
+    assert ss.os.environ["VOICE_TURN_DETECTOR"] == "smart_turn"
+    assert ss.os.environ["VOICE_SPECULATIVE"] == "1"
+    reloaded = ss.load_settings()
+    assert reloaded["turn_detector"] == "smart_turn"
+    assert reloaded["voice_speculative"] is True
+
+
+def test_unknown_turn_detector_rejected(settings_file):
+    with pytest.raises(ValueError):
+        ss.save_settings({"turn_detector": "telepathy"})
+
+
+def test_options_list_every_turn_detector(settings_file):
+    ids = [o["id"] for o in ss.options_catalog()["turn_detector"]]
+    assert ids == ["silence", "smart_turn", "vap", "flux"]

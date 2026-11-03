@@ -294,6 +294,27 @@ function renderBotDebug(wrap = botLineWrap ?? lastBotLineWrap) {
     lines.join("") || `<span class="dbg-line">Waiting for response…</span>`;
 }
 
+/** Join speech fragments: "Actually, I" + "see... Yeah." → one sentence. */
+function joinUtterance(prev, next) {
+  const a = (prev || "").trim();
+  const b = (next || "").trim();
+  if (!a) return b;
+  if (!b || a.endsWith(b)) return a;
+  if (b.startsWith(a)) return b;
+  return `${a} ${b}`;
+}
+
+/** Grow the last "You" line if nothing was posted after it (caller paused mid-sentence). */
+function appendToOpenUserLine(text) {
+  const last = transcriptMessages.lastElementChild;
+  if (!last || !last.classList.contains("user")) return false;
+  const body = last.querySelector(".body");
+  if (!body) return false;
+  body.textContent = joinUtterance(body.textContent, text);
+  transcriptMessages.scrollTop = transcriptMessages.scrollHeight;
+  return true;
+}
+
 function addMessage(who, text, { at = new Date(), pending = false, sentAt = null } = {}) {
   transcriptMessages.querySelector(".hint")?.remove();
   const wrap = document.createElement("div");
@@ -519,7 +540,9 @@ function buildClient() {
         if (!data.final) return;
         const sentAt = Date.now();
         if (!userTurnPending) beginTurnTiming();
-        addMessage("user", data.text, { at: new Date(sentAt), sentAt });
+        if (!appendToOpenUserLine(data.text)) {
+          addMessage("user", data.text, { at: new Date(sentAt), sentAt });
+        }
         debugLog("user transcript", data.text);
         logClientEvent("user_voice", {
           text: data.text,

@@ -95,6 +95,8 @@ from db_appointments import (  # noqa: F401
     _appointment_is_upcoming,
     _complete_past_appointments_for_patient,
     _enrich_appointment,
+    _enrich_appointments,
+    delete_appointments_before,
     _find_active_appointment_for_patient,
     _find_conflict,
     _get_next_appointment_id,

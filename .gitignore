@@ -57,3 +57,12 @@ GraphApi.py
 FuctionalApi.py
 *.bak
 *.tmp
+
+# --- Landing page (web/) build artefacts ---
+web/node_modules/
+web/.next/
+web/out/
+web/tsconfig.tsbuildinfo
+
+# Golden eval snapshots hold real caller names/phones
+eval/golden/

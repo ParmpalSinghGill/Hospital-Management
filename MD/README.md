@@ -4,6 +4,7 @@ How to run and use each part of DBC Care. Start from the [main README](../README
 
 | Guide | What it covers | Command |
 |-------|----------------|---------|
+| [How it works](how-it-works.md) | Full start-to-end overview, turn-taking, metrics | — |
 | [Web interface](web-interface.md) | Chat + voice in the browser, Admin | `python bot.py` |
 | [CLI text desk](cli.md) | Terminal booking (no browser) | `python Main.py` |
 | [MCP local](mcp-local.md) | MCP for Cursor / Claude Desktop | `python mcp_server.py` |

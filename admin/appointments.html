@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,650&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/admin/static/style.css?v=12" />
+  <link rel="stylesheet" href="/admin/static/style.css?v=13" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -36,10 +36,10 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Upcoming schedule</h2>
+        <h2>Schedule</h2>
         <button id="refresh-appts" type="button" class="ghost">Refresh</button>
       </div>
-      <p class="hint">Choose a department and doctor to list appointments from now onward. Click a doctor name for their schedule, or a card/patient to open the patient record.</p>
+      <p class="hint">Choose a department and doctor to list appointments. Click a doctor name for their schedule, or a card/patient to open the patient record.</p>
 
       <div class="filters">
         <label>
@@ -54,14 +54,35 @@
             <option value="">All doctors</option>
           </select>
         </label>
+        <label>
+          <span>Show</span>
+          <select id="filter-range">
+            <option value="upcoming">Upcoming only</option>
+            <option value="all">All (incl. past)</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="appt-toolbar">
+        <button id="sort-time" type="button" class="ghost" aria-label="Sort by time">Time ↑ oldest first</button>
+        <div class="appt-delete">
+          <label for="delete-before-date">Delete all before</label>
+          <input id="delete-before-date" type="date" />
+          <button id="delete-before-btn" type="button" class="ghost danger-btn">Delete</button>
+        </div>
       </div>
 
       <p id="appt-meta" class="meta-line"></p>
       <div id="appt-list" class="appt-grid"></div>
+      <div id="appt-pager" class="appt-pager" hidden>
+        <button id="page-prev" type="button" class="ghost">← Prev</button>
+        <span id="page-info"></span>
+        <button id="page-next" type="button" class="ghost">Next →</button>
+      </div>
     </section>
   </div>
 
   <script src="/admin/static/common.js?v=8"></script>
-  <script src="/admin/static/appointments.js?v=7"></script>
+  <script src="/admin/static/appointments.js?v=8"></script>
 </body>
 </html>

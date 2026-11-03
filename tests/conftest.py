@@ -5,6 +5,16 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolated_speculation_csv(tmp_path, monkeypatch):
+    """Keep speculation stats from tests out of metrics/speculation.csv."""
+    import speculation_stats
+
+    monkeypatch.setattr(speculation_stats, "SPECULATION_CSV", tmp_path / "speculation.csv")
+    monkeypatch.setattr(speculation_stats, "_TOTALS", {})
+    yield
+
+
 @pytest.fixture
 def isolated_db(tmp_path, monkeypatch):
     """Point the data layer at a fresh temp SQLite file and seed two doctors."""

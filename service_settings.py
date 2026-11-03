@@ -47,6 +47,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "save_llm_messages": False,
     # Silence after user speech before the turn is sent to the LLM (cascade voice).
     "vad_stop_secs": 0.2,
+    # End-of-turn method for cascade voice (see turn_detection.py):
+    # silence | smart_turn | vap | flux.
+    "turn_detector": "silence",
+    # smart_turn / vap / flux: longest "not finished yet" pause before the turn ends anyway.
+    "max_silence_secs": 2.0,
+    # Start the agent at the early end-of-turn signal; writes wait for confirmation.
+    "voice_speculative": False,
     # Flat booleans persist reliably from the admin UI (nested dicts were flaky in practice).
     "enable_deepseek": True,
     "enable_glm": True,
@@ -62,10 +69,12 @@ ALLOWED = {
     "cascade_llm": {"glm", "groq", "openai", "deepseek"},
     "cli_llm": {"groq", "glm", "openai", "deepseek"},
     "voice_pipeline_default": {"cascade", "realtime"},
+    # Same ids as turn_detection.DETECTORS (kept here so settings never import Pipecat).
+    "turn_detector": {"silence", "smart_turn", "vap", "flux"},
 }
 
 _ENABLE_KEYS = {f"enable_{pid}" for pid in PROVIDER_IDS}
-_BOOL_KEYS = {"debug_mode", "save_llm_messages"} | _ENABLE_KEYS
+_BOOL_KEYS = {"debug_mode", "save_llm_messages", "voice_speculative"} | _ENABLE_KEYS
 
 
 def enabled_providers_map(settings: dict[str, Any] | None = None) -> dict[str, bool]:
@@ -139,6 +148,15 @@ def clamp_vad_stop_secs(value: Any) -> float:
     return max(0.1, min(3.0, round(stop, 2)))
 
 
+def clamp_max_silence_secs(value: Any) -> float:
+    """Model detectors' max pause: 0.3–5.0s (matches turn_detection)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = float(DEFAULT_SETTINGS["max_silence_secs"])
+    return max(0.3, min(5.0, round(v, 2)))
+
+
 def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
     # Keep flat enable_* flags as source of truth; expose nested map for the UI/API.
     enabled = enabled_providers_map(data)
@@ -151,6 +169,10 @@ def _coerce_settings(data: dict[str, Any]) -> dict[str, Any]:
     data["debug_mode"] = bool(data.get("debug_mode", False))
     data["save_llm_messages"] = bool(data.get("save_llm_messages", False))
     data["vad_stop_secs"] = clamp_vad_stop_secs(data.get("vad_stop_secs"))
+    detector = str(data.get("turn_detector") or "").strip().lower()
+    data["turn_detector"] = detector if detector in ALLOWED["turn_detector"] else "silence"
+    data["max_silence_secs"] = clamp_max_silence_secs(data.get("max_silence_secs"))
+    data["voice_speculative"] = bool(data.get("voice_speculative", False))
     data["cascade_llm"] = resolve_llm_choice(data, "cascade_llm")
     data["cli_llm"] = resolve_llm_choice(data, "cli_llm")
     data["voice_pipeline_default"] = resolve_voice_pipeline(data)
@@ -201,6 +223,9 @@ def save_settings(updates: dict[str, Any]) -> dict[str, Any]:
         if key == "vad_stop_secs":
             current[key] = clamp_vad_stop_secs(value)
             continue
+        if key == "max_silence_secs":
+            current[key] = clamp_max_silence_secs(value)
+            continue
         if key in ALLOWED and str(value) not in ALLOWED[key]:
             raise ValueError(f"Invalid value for {key}: {value}")
         current[key] = value
@@ -245,6 +270,9 @@ def apply_settings_to_env(settings: dict[str, Any] | None = None) -> None:
     os.environ["BOT_MODE"] = resolve_voice_pipeline(s)
     os.environ["ENABLED_REALTIME"] = "1" if is_provider_enabled(s, "realtime") else "0"
     os.environ["VAD_STOP_SECS"] = str(clamp_vad_stop_secs(s.get("vad_stop_secs")))
+    os.environ["VOICE_TURN_DETECTOR"] = str(s.get("turn_detector") or "silence")
+    os.environ["VOICE_MAX_SILENCE_SECS"] = str(clamp_max_silence_secs(s.get("max_silence_secs")))
+    os.environ["VOICE_SPECULATIVE"] = "1" if s.get("voice_speculative") else "0"
 
 
 def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -269,7 +297,28 @@ def options_catalog(settings: dict[str, Any] | None = None) -> dict[str, Any]:
 
     from industry_profile import all_profiles
 
+    try:
+        from turn_detection import detector_options
+
+        detectors = detector_options()
+    except Exception:
+        detectors = [
+            {"id": d, "label": d, "available": True, "reason": ""}
+            for d in ("silence", "smart_turn", "vap", "flux")
+        ]
+
     return {
+        "turn_detector": [
+            {
+                "id": d["id"],
+                "label": d["label"] + ("" if d["available"] else " (not installed)"),
+                # Not selectable until its model / packages are installed.
+                "enabled": bool(d["available"]),
+                "available": d["available"],
+                "reason": d["reason"],
+            }
+            for d in detectors
+        ],
         "industry": [
             {"id": p["id"], "label": p["label"], "enabled": True} for p in all_profiles()
         ],

@@ -23,7 +23,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
-from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -35,8 +34,6 @@ from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService, LiveOptions
 from pipecat.services.deepgram.tts import DeepgramTTSService
-from pipecat.turns.user_start import VADUserTurnStartStrategy
-from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
 from pipecat.turns.user_turn_strategies import UserTurnStrategies
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
@@ -55,7 +52,14 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.workers.runner import WorkerRunner
 
 from interrupt_trace import InterruptTraceProcessor
-from soft_speech_turn_start import SoftSpeechUserTurnStartStrategy
+from speculation import UserTurnText, make_transcript_tap
+from turn_detection import (
+    build_flux_stt,
+    build_turn_setup,
+    clamp_stop_secs,
+    silence_turn_strategies,
+    vad_params,
+)
 from turn_metrics import TurnMetricsObserver
 from user_mute_safe import SafeBotSpeakingMuteStrategy
 from voice_bridge import (
@@ -87,19 +91,9 @@ except Exception:
     pass
 
 
-def _clamp_stop_secs(stop_secs: float | None) -> float:
-    """Client slider 0.1–3s; default matches Pipecat stock VAD (0.2s)."""
-    try:
-        stop = float(stop_secs) if stop_secs is not None else 0.2
-    except (TypeError, ValueError):
-        stop = 0.2
-    return max(0.1, min(3.0, round(stop, 2)))
-
-
-def _vad_params(stop_secs: float | None = None) -> VADParams:
-    """Pipecat-default VAD start sensitivity; ``stop_secs`` from Admin settings."""
-    stop = _clamp_stop_secs(stop_secs)
-    return VADParams(confidence=0.7, start_secs=0.2, stop_secs=stop, min_volume=0.6)
+# Kept under their old names: tests and callers import them from bot.
+_clamp_stop_secs = clamp_stop_secs
+_vad_params = vad_params
 
 
 def _user_turn_strategies(
@@ -107,32 +101,8 @@ def _user_turn_strategies(
     *,
     shared_state: dict | None = None,
 ) -> UserTurnStrategies:
-    """VAD + soft-speech STT start; speech-timeout stop (honors stop_secs).
-
-    Pipecat default stop is LocalSmartTurnAnalyzerV3 (ignores ``stop_secs``).
-    Recent sessions also showed STT finals in chat with **no** VAD turn start —
-    only VAD start left those turns dead. SoftSpeech starts from finalized STT
-    when the bot is idle; SpeechTimeout then ends after ``stop_secs``.
-    """
-    stop = _clamp_stop_secs(stop_secs)
-    state = shared_state if shared_state is not None else {}
-
-    def _turn_start_blocked() -> bool:
-        # Avoid cutting TTS / mid-agent audio with a late transcript turn.
-        return bool(state.get("bot_speaking") or state.get("busy"))
-
-    return UserTurnStrategies(
-        start=[
-            VADUserTurnStartStrategy(),
-            SoftSpeechUserTurnStartStrategy(is_blocked=_turn_start_blocked),
-        ],
-        stop=[
-            SpeechTimeoutUserTurnStopStrategy(
-                user_speech_timeout=stop,
-                wait_for_transcript=True,
-            )
-        ],
-    )
+    """Silence method's strategies — see ``turn_detection.silence_turn_strategies``."""
+    return silence_turn_strategies(stop_secs, shared_state=shared_state)
 
 
 def build_cascade_pipeline(
@@ -143,8 +113,15 @@ def build_cascade_pipeline(
     call_id: str = "",
     stop_secs: float | None = None,
     shared_state: dict | None = None,
+    turn_detector: str = "silence",
+    max_silence_secs: float | None = None,
+    speculative: bool = False,
 ) -> Pipeline:
-    """Deepgram STT → existing Main.py LangGraph (GLM) → Deepgram TTS."""
+    """Deepgram STT → existing Main.py LangGraph (GLM) → Deepgram TTS.
+
+    ``turn_detector`` picks the end-of-turn method (``turn_detection.py``);
+    ``speculative`` starts the agent at the early end-of-turn signal.
+    """
     # Boost month / phone / booking phrases so DOB-style dates and numbers transcribe cleaner.
     stt_keyterms = [
         "January", "February", "March", "April", "May", "June",
@@ -152,7 +129,20 @@ def build_cascade_pipeline(
         "phone", "appointment", "doctor", "prescription", "medicine",
         "tomorrow", "today", "morning", "afternoon", "evening",
     ]
-    stt = DeepgramSTTService(
+    call_key = call_id or thread_id
+    state = shared_state if shared_state is not None else {}
+    setup = build_turn_setup(
+        turn_detector,
+        stop_secs=stop_secs,
+        max_silence_secs=max_silence_secs,
+        speculative=speculative,
+        shared_state=state,
+    )
+    stt = build_flux_stt(
+        keyterms=stt_keyterms,
+        speculative=speculative,
+        max_silence_secs=setup.max_silence_secs,
+    ) if setup.uses_flux else DeepgramSTTService(
         api_key=os.getenv("DEEPGRAM_API_KEY"),
         live_options=LiveOptions(
             model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
@@ -168,35 +158,51 @@ def build_cascade_pipeline(
         voice=os.getenv("DEEPGRAM_VOICE", "aura-2-thalia-en"),
     )
 
-    call_key = call_id or thread_id
-    state = shared_state if shared_state is not None else {}
     graph_app = get_shared_reception_graph(llm_provider=os.getenv("LLM_PROVIDER", "deepseek"))
+    turn_text = UserTurnText()
     agent = make_langgraph_processor(
-        thread_id, graph_app, call_id=call_key, shared_state=state
+        thread_id,
+        graph_app,
+        call_id=call_key,
+        shared_state=state,
+        speculation=setup.speculation,
+        turn_text=turn_text,
     )
+    # Mirrors transcripts for VAD-pause speculation (the aggregator swallows them).
+    transcript_tap = make_transcript_tap(
+        turn_text,
+        on_update=agent.on_transcript_update if setup.speculation == "vad" else None,
+    )
+    if setup.uses_flux:
+
+        @stt.event_handler("on_eager_end_of_turn")
+        async def _on_eager_end_of_turn(_service, transcript):
+            await agent.on_early_end_of_turn(transcript)
+
+        @stt.event_handler("on_turn_resumed")
+        async def _on_turn_resumed(_service):
+            await agent.on_turn_resumed()
+
     interrupt_trace = InterruptTraceProcessor(call_key, state)
 
-    vad_params = _vad_params(stop_secs)
-    turn_strategies = _user_turn_strategies(stop_secs, shared_state=state)
     logger.info(
-        f"Cascade VAD params={vad_params} "
-        f"turn_start=VAD+SoftSpeech "
-        f"turn_stop=SpeechTimeout(user_speech_timeout={_clamp_stop_secs(stop_secs)})"
+        f"Cascade turn detector={setup.detector} speculative={setup.speculation or 'off'} "
+        f"VAD params={setup.vad} end_of_speech_wait={_clamp_stop_secs(stop_secs)} "
+        f"max_silence={setup.max_silence_secs}"
     )
 
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(params=vad_params),
+            vad_analyzer=SileroVADAnalyzer(params=setup.vad),
             # While TTS is playing, ignore mic activity so barge-in from echo
             # cannot cut the second half of a multi-sentence reply. Also unmute
             # on InterruptionFrame so a cut reply cannot leave the mic stuck off.
             user_mute_strategies=[SafeBotSpeakingMuteStrategy()],
-            # Drop TranscriptionUserTurnStartStrategy: delayed STT of earlier
-            # speech was starting a new turn mid-TTS and cutting audio + chat text.
-            # Explicit SpeechTimeout stop — do NOT leave Pipecat's default
-            # LocalSmartTurnAnalyzerV3 in place (it ignores stop_secs).
-            user_turn_strategies=turn_strategies,
+            # Chosen end-of-turn method (turn_detection.build_turn_setup). The
+            # silence method keeps the explicit SpeechTimeout stop — Pipecat's
+            # default LocalSmartTurnAnalyzerV3 would ignore stop_secs.
+            user_turn_strategies=setup.strategies,
         ),
     )
 
@@ -255,6 +261,7 @@ def build_cascade_pipeline(
         [
             transport.input(),
             stt,
+            transcript_tap,
             user_aggregator,
             interrupt_trace,
             agent,
@@ -324,10 +331,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         stop_secs = float(os.getenv("VAD_STOP_SECS", "0.2"))
     except (TypeError, ValueError):
         stop_secs = 0.2
+    turn_detector = os.getenv("VOICE_TURN_DETECTOR", "silence")
+    max_silence_secs: float | None = None
+    speculative = os.getenv("VOICE_SPECULATIVE", "0").strip().lower() in ("1", "true", "yes", "on")
     try:
         from service_settings import clamp_vad_stop_secs, load_settings
 
-        stop_secs = clamp_vad_stop_secs(load_settings().get("vad_stop_secs", stop_secs))
+        voice_settings = load_settings()
+        stop_secs = clamp_vad_stop_secs(voice_settings.get("vad_stop_secs", stop_secs))
+        turn_detector = str(voice_settings.get("turn_detector") or turn_detector)
+        max_silence_secs = voice_settings.get("max_silence_secs")
+        speculative = bool(voice_settings.get("voice_speculative", speculative))
     except Exception:
         stop_secs = _clamp_stop_secs(stop_secs)
     stop_secs = _clamp_stop_secs(stop_secs)
@@ -350,6 +364,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
 
     logger.info(
         f"Starting ReceptionAi voice (mode={mode}, stop_secs={stop_secs}, "
+        f"turn_detector={turn_detector}, speculative={speculative}, "
         f"call_id={call_id}, thread_id={thread_id}, webrtc_session={webrtc_session_id or 'n/a'})"
     )
 
@@ -387,6 +402,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             call_id=call_id,
             stop_secs=stop_secs,
             shared_state=shared_state,
+            turn_detector=turn_detector,
+            max_silence_secs=max_silence_secs,
+            speculative=speculative,
         )
         try:
             from llm_message_dump import write_session_runtime_meta
@@ -401,6 +419,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
                     "min_volume": vad.min_volume,
                     "pipeline_mode": mode,
                     "thread_id": thread_id,
+                    "turn_detector": turn_detector,
+                    "max_silence_secs": max_silence_secs,
+                    "voice_speculative": speculative,
                 },
             )
         except Exception as e:
@@ -473,8 +494,22 @@ def _mount_custom_client() -> None:
     app.include_router(log_router)
     app.include_router(tool_router)
 
+    # Landing page: static Next.js export from web/ (`cd web && npm run build`).
+    # Its "Request a call" button opens /app/?call=1. Falls back to the older
+    # Python-rendered landing.py page when web/out has not been built.
+    web_out = _ROOT / "web" / "out"
+    if (web_out / "_next").is_dir():
+        app.mount(
+            "/_next",
+            StaticFiles(directory=web_out / "_next"),
+            name="landing-assets",
+        )
+
     @app.get("/", include_in_schema=False)
     async def root_chooser():
+        index = web_out / "index.html"
+        if index.is_file():
+            return HTMLResponse(index.read_text(encoding="utf-8"))
         # Rendered per request so an industry change in Admin shows up immediately.
         from landing import render
 

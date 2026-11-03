@@ -22,6 +22,7 @@ from database import (
     check_slot_bookable,
     normalize_appointment_time,
 )
+from speculation import hold_side_effects
 from tools_common import _slot_refusal
 
 
@@ -34,6 +35,7 @@ def book_appointment(
     address: str = "",
 ) -> str:
     """Book an appointment after validating doctor exists and time is free."""
+    hold_side_effects()  # speculative voice turns: wait until the turn is confirmed
     logging.info("book_appointment %s %s %s %s", patient_name, phone, doctor, time)
     doctor_row = _get_doctor_by_name(doctor)
     if not doctor_row:
@@ -193,6 +195,7 @@ def cancel_appointment(
     phone: str = "",
 ) -> str:
     """Cancel an existing appointment by ID, or by phone if the patient has one active appointment."""
+    hold_side_effects()  # speculative voice turns: wait until the turn is confirmed
     logging.info("cancel_appointment id=%s phone=%s", appointment_id, phone)
 
     appts = _load_all_appointments()
@@ -246,6 +249,7 @@ def reschedule_appointment(
     phone: str = "",
 ) -> str:
     """Reschedule an existing appointment to a new time."""
+    hold_side_effects()  # speculative voice turns: wait until the turn is confirmed
     logging.info(
         "reschedule_appointment id=%s phone=%s new_time=%s",
         appointment_id,

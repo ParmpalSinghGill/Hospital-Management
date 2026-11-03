@@ -46,6 +46,32 @@ function showLogin() {
   setView("login");
 }
 
+// End-of-turn methods from /admin/api/settings options (with install status).
+let turnDetectorOptions = [];
+
+const TURN_DETECTOR_HELP = {
+  silence: "Ends the turn after a fixed silence (Silence before reply).",
+  smart_turn: "Audio model judges from intonation whether the caller is done. Runs locally on CPU.",
+  vap: "Predicts who speaks next. Needs PyTorch and `python setup_vap.py`.",
+  flux: "Deepgram Flux transcribes and detects end of turn in one service (Deepgram usage).",
+};
+
+function syncTurnDetectorHint() {
+  const sel = document.getElementById("turn_detector");
+  const hint = document.getElementById("turn_detector_hint");
+  const maxSilenceEl = document.getElementById("max_silence_secs");
+  if (!sel || !hint) return;
+  const missing = turnDetectorOptions
+    .filter((o) => o.available === false && o.reason)
+    .map((o) => `${o.label}: ${o.reason}`);
+  hint.textContent = [TURN_DETECTOR_HELP[sel.value] || "", ...missing].filter(Boolean).join(" · ");
+  if (maxSilenceEl) maxSilenceEl.disabled = sel.value === "silence";
+}
+
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.id === "turn_detector") syncTurnDetectorHint();
+});
+
 function fillSelect(el, options, selected) {
   if (!el) return;
   el.innerHTML = "";
@@ -208,7 +234,8 @@ async function loadResponseTimings() {
     const text = data.first_text || {};
     const speech = data.first_speech || {};
     if (meta) {
-      meta.textContent = `${data.session_count || 0} sessions · ${data.turn_count || 0} turns · ${data.user_count || 0} users`;
+      const demo = data.demo_session_count ? ` · ${data.demo_session_count} demo sessions excluded` : "";
+      meta.textContent = `${data.session_count || 0} sessions · ${data.turn_count || 0} turns · ${data.user_count || 0} users${demo}`;
     }
     el.innerHTML = "";
     const cards = [
@@ -291,6 +318,16 @@ async function loadSettings() {
     const n = Number(s.vad_stop_secs);
     stopSecsEl.value = String(Number.isFinite(n) ? n : 0.2);
   }
+  turnDetectorOptions = o.turn_detector || [];
+  fillSelect(document.getElementById("turn_detector"), turnDetectorOptions, s.turn_detector);
+  const maxSilenceEl = document.getElementById("max_silence_secs");
+  if (maxSilenceEl) {
+    const n = Number(s.max_silence_secs);
+    maxSilenceEl.value = String(Number.isFinite(n) ? n : 2);
+  }
+  const specEl = document.getElementById("voice_speculative");
+  if (specEl) specEl.checked = Boolean(s.voice_speculative);
+  syncTurnDetectorHint();
   syncRoutingAvailability();
 }
 
@@ -390,6 +427,9 @@ async function saveSettings() {
     debug_mode: Boolean(document.getElementById("debug_mode")?.checked),
     save_llm_messages: Boolean(document.getElementById("save_llm_messages")?.checked),
     vad_stop_secs: Number(document.getElementById("vad_stop_secs")?.value || 0.2),
+    turn_detector: document.getElementById("turn_detector")?.value || "silence",
+    max_silence_secs: Number(document.getElementById("max_silence_secs")?.value || 2),
+    voice_speculative: Boolean(document.getElementById("voice_speculative")?.checked),
   };
   try {
     const res = await api("/admin/api/settings", {

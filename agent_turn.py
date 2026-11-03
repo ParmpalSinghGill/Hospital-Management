@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 # DeepSeek sometimes emits tool calls as fullwidth-pipe DSML markup in plain text.
@@ -424,13 +425,75 @@ def run_turn(
     *,
     recursion_limit: int = 25,
     call_id: str | None = None,
+    seed_state: dict[str, Any] | None = None,
+    deferred_logs: list[Callable[[], None]] | None = None,
+    on_tool_start: Callable[[str], None] | None = None,
 ) -> TurnResult:
-    """Run one user turn on the compiled ReceptionAi LangGraph app."""
+    """Run one user turn on the compiled ReceptionAi LangGraph app.
+
+    ``seed_state`` and ``deferred_logs`` are for speculative voice turns
+    (see ``speculation.py``):
+
+    * ``seed_state`` — history copied from the real conversation. The turn runs
+      on ``thread_id`` (a fresh scratch thread) starting from that history, so a
+      discarded guess never touches the real thread.
+    * ``deferred_logs`` — when given, call-log writes are appended here instead
+      of run, so a discarded guess leaves no rows. Run them on confirmation.
+
+    ``on_tool_start(tool_name)`` is called from a worker thread when the
+    model starts a tool (voice uses it to say "Let me check…").
+    """
+    import tool_progress
+
+    token = tool_progress.set_hook(on_tool_start)
+    try:
+        return _run_turn(
+            app,
+            user_input,
+            thread_id,
+            recursion_limit=recursion_limit,
+            call_id=call_id,
+            seed_state=seed_state,
+            deferred_logs=deferred_logs,
+        )
+    finally:
+        tool_progress.reset_hook(token)
+
+
+def _run_turn(
+    app: Any,
+    user_input: str,
+    thread_id: str,
+    *,
+    recursion_limit: int,
+    call_id: str | None,
+    seed_state: dict[str, Any] | None,
+    deferred_logs: list[Callable[[], None]] | None,
+) -> TurnResult:
     log_id = call_id or thread_id
+
+    def _log(fn: Callable[[], None]) -> None:
+        if deferred_logs is None:
+            fn()
+        else:
+            deferred_logs.append(fn)
+
+    # Tag this turn's LLM calls for per-call timing (llm_timing.py).
+    import llm_timing
+
+    on_call = None
+    if deferred_logs is not None:
+        from speculation import speculation_gate
+
+        gate = speculation_gate.get()
+        on_call = gate.note_llm_call if gate is not None else None
+    llm_timing.set_scope(log_id, speculative=deferred_logs is not None, on_call=on_call)
+
     try:
         from conversation_log import set_current_call_id
 
-        set_current_call_id(log_id)
+        # A guess must not tag the live call log from inside read tools.
+        set_current_call_id("" if deferred_logs is not None else log_id)
     except Exception:
         pass
 
@@ -438,7 +501,13 @@ def run_turn(
         "recursion_limit": recursion_limit,
         "configurable": {"thread_id": thread_id},
     }
-    result = app.invoke({"messages": [("user", user_input)]}, config=config)
+    first_input: dict[str, Any] = {"messages": [("user", user_input)]}
+    if seed_state:
+        first_input = {
+            **seed_state,
+            "messages": [*list(seed_state.get("messages") or []), ("user", user_input)],
+        }
+    result = app.invoke(first_input, config=config)
     text = extract_assistant_text(result)
     agent = str((result or {}).get("last_agent") or "")
     # Some LangGraph/checkpointer combinations omit non-message state keys from
@@ -451,7 +520,7 @@ def run_turn(
             agent = str(values.get("last_agent") or "")
         except Exception:
             pass
-    _log_turn_tool_calls(result, call_id=log_id, agent=agent)
+    _log(lambda r=result, a=agent: _log_turn_tool_calls(r, call_id=log_id, agent=a))
 
     # DeepSeek often finishes with DSML text instead of executing tools — nudge and retry.
     attempts = 0
@@ -481,7 +550,7 @@ def run_turn(
                 agent = str(values.get("last_agent") or "")
             except Exception:
                 pass
-        _log_turn_tool_calls(result, call_id=log_id, agent=agent)
+        _log(lambda r=result, a=agent: _log_turn_tool_calls(r, call_id=log_id, agent=a))
         if (
             text
             and not is_incomplete_tool_reply(text)
@@ -505,13 +574,16 @@ def run_turn(
         )
         agent = agent or "recovery"
     else:
-        _link_patient_from_graph_result(log_id, result)
+        _log(lambda r=result: _link_patient_from_graph_result(log_id, r))
 
-    try:
-        from conversation_log import note_turn_meta
+    def _note_meta(a: str = agent) -> None:
+        try:
+            from conversation_log import note_turn_meta
 
-        note_turn_meta(log_id, agent_name=agent)
-    except Exception:
-        pass
+            note_turn_meta(log_id, agent_name=a)
+        except Exception:
+            pass
+
+    _log(_note_meta)
 
     return TurnResult(text=text, agent=agent)

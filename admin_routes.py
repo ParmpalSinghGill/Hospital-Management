@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Cookie, HTTPException, Query, Response
+from loguru import logger
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -22,6 +24,8 @@ from conversation_log import (
 from admin_credits import collect_credit_reports
 from database import (
     _enrich_appointment,
+    _enrich_appointments,
+    delete_appointments_before,
     _get_doctor_by_id,
     _get_doctor_by_name,
     _get_patient_by_id,
@@ -104,7 +108,19 @@ def _page(name: str) -> FileResponse:
     )
 
 
+_CANON_TIME = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+
 def _parse_appt_time(value: str) -> Optional[datetime]:
+    # Stored times are "YYYY-MM-DD HH:MM"; slicing them is ~20x faster than
+    # the general parser (which strptimes twice), and this runs per row.
+    if _CANON_TIME.match(value or ""):
+        try:
+            return datetime(
+                int(value[0:4]), int(value[5:7]), int(value[8:10]), int(value[11:13]), int(value[14:16])
+            )
+        except ValueError:
+            pass
     return parse_appointment_datetime(value)
 
 
@@ -130,6 +146,9 @@ class SettingsBody(BaseModel):
     debug_mode: bool | None = None
     save_llm_messages: bool | None = None
     vad_stop_secs: float | None = None
+    turn_detector: str | None = None
+    max_silence_secs: float | None = None
+    voice_speculative: bool | None = None
     enabled_providers: dict[str, bool] | None = None
     # Flat flags (preferred) — False values must not be dropped on save.
     enable_deepseek: bool | None = None
@@ -333,28 +352,45 @@ async def doctor_unavailable_delete(
     return {"ok": True, "removed": block_id}
 
 
+# Plain ``def``: FastAPI runs it in a worker thread. As ``async def`` its
+# blocking DB work froze the whole server (voice calls included) while it ran.
 @router.get("/api/appointments")
-async def appointments(
+def appointments(
     department: Optional[str] = Query(default=None),
     doctor_id: Optional[str] = Query(default=None),
     doctor: Optional[str] = Query(default=None),
     from_now: bool = Query(default=True),
     include_cancelled: bool = Query(default=False),
+    sort: str = Query(default="asc", pattern="^(asc|desc)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
     admin_token: str | None = Cookie(default=None),
 ):
-    """Future (or all) appointments, filterable by department / doctor."""
+    """Future (or all) appointments, filterable by department / doctor, paged.
+
+    ``count`` is the total across pages; ``appointments`` holds one page.
+    """
     _require_auth(admin_token)
     now = datetime.now()
     dep = (department or "").strip().lower()
     doc_id = (doctor_id or "").strip().upper()
     doc_name = _normalize_doctor_name(doctor) if doctor else ""
 
-    rows: list[dict[str, Any]] = []
+    # Cheap filters on raw rows first, then enrich only the survivors in one
+    # batch. Enriching every row (15k) one by one took ~50 s.
+    candidates: list[tuple[dict[str, Any], datetime | None]] = []
     for a in _load_all_appointments():
         if not include_cancelled and a.get("status") == "CANCELLED":
             continue
+        when = _parse_appt_time(str(a.get("time") or ""))
+        if from_now and (when is None or when < now):
+            continue
+        candidates.append((a, when))
 
-        enriched = _enrich_appointment(a)
+    rows: list[dict[str, Any]] = []
+    # Doctor/department only — patient names are filled in for the page below.
+    enriched_rows = _enrich_appointments([a for a, _ in candidates], with_patients=False)
+    for enriched, (_a, when) in zip(enriched_rows, candidates):
         a_dep = (enriched.get("department") or "").strip().lower()
         a_doc_id = str(enriched.get("doctor_id") or "").strip().upper()
         a_doc_name = _normalize_doctor_name(str(enriched.get("doctor") or ""))
@@ -366,19 +402,49 @@ async def appointments(
         if doc_name and a_doc_name != doc_name:
             continue
 
-        when = _parse_appt_time(str(enriched.get("time") or ""))
-        if from_now:
-            if when is None or when < now:
-                continue
-
         enriched["_sort_time"] = when.isoformat() if when else ""
         rows.append(enriched)
 
-    rows.sort(key=lambda r: r.get("_sort_time") or r.get("time") or "")
-    for r in rows:
+    rows.sort(key=lambda r: r.get("_sort_time") or r.get("time") or "", reverse=sort == "desc")
+    total = len(rows)
+    pages = max(1, -(-total // page_size))
+    page = min(page, pages)
+    start = (page - 1) * page_size
+    page_rows = _enrich_appointments(rows[start : start + page_size])
+    for r in page_rows:
         r.pop("_sort_time", None)
 
-    return {"ok": True, "count": len(rows), "appointments": rows, "as_of": now.strftime("%Y-%m-%d %H:%M")}
+    return {
+        "ok": True,
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+        "sort": sort,
+        "appointments": page_rows,
+        "as_of": now.strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+class DeleteBeforeBody(BaseModel):
+    before: str  # YYYY-MM-DD; appointments on this day are kept
+    dry_run: bool = False
+
+
+@router.post("/api/appointments/delete-before")
+def appointments_delete_before(
+    body: DeleteBeforeBody,
+    admin_token: str | None = Cookie(default=None),
+):
+    """Delete all appointments (any status) dated before ``before``."""
+    _require_auth(admin_token)
+    try:
+        n = delete_appointments_before(body.before, dry_run=body.dry_run)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="before must be a date like 2026-11-02") from None
+    if not body.dry_run:
+        logger.warning(f"Admin deleted {n} appointments before {body.before}")
+    return {"ok": True, "before": body.before[:10], "dry_run": body.dry_run, "count": n}
 
 
 @router.get("/api/patients")

@@ -368,6 +368,36 @@ function beginTurnTiming(mode) {
   lastShownBotText = "";
 }
 
+/** Join speech fragments: "Actually, I" + "see... Yeah." → one sentence. */
+function joinUtterance(prev, next) {
+  const a = (prev || "").trim();
+  const b = (next || "").trim();
+  if (!a) return b;
+  if (!b || a.endsWith(b)) return a;
+  if (b.startsWith(a)) return b;
+  return `${a} ${b}`;
+}
+
+/**
+ * When the caller pauses mid-sentence, STT sends several finals. If nothing
+ * has been posted since the last user bubble, grow it instead of adding one.
+ */
+function appendToOpenUserBubble(text) {
+  if (!lastUserMsgEl || messagesEl.lastElementChild !== lastUserMsgEl) return false;
+  const bubble = lastUserMsgEl.querySelector(".bubble");
+  if (!bubble) return false;
+  bubble.textContent = joinUtterance(bubble.textContent, text);
+  scrollToBottom();
+  return true;
+}
+
+/** "Let me check…" said while a tool runs — its own small bubble, not logged as the reply. */
+function addFillerMessage(text) {
+  if (!text) return;
+  const bubble = addMessage("assistant", text);
+  bubble.parentElement?.classList.add("filler");
+}
+
 function addMessage(role, text, { sentAt = null } = {}) {
   hideWelcome();
   const wrap = document.createElement("div");
@@ -913,6 +943,8 @@ function buildClient() {
         // Primary chat text from voice_bridge.
         if (data?.type === "bot_chat_text") {
           ingestBotText(data?.text ?? "", "server");
+        } else if (data?.type === "bot_filler_text") {
+          addFillerMessage(data?.text ?? "");
         }
       },
       onBotLlmStopped: () => {
@@ -925,7 +957,7 @@ function buildClient() {
           return;
         }
         const sentAt = Date.now();
-        addMessage("user", data.text, { sentAt });
+        if (!appendToOpenUserBubble(data.text)) addMessage("user", data.text, { sentAt });
         updateVoiceCaption("");
         logClientEvent("user_voice", {
           text: data.text,
